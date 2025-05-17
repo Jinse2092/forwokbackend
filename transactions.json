@@ -1,0 +1,13 @@
+[
+  {
+    "merchantId": "merchant-1746860457946",
+    "inboundId": "inb-1746875952822",
+    "productId": null,
+    "type": "inbound_fee",
+    "quantity": 1,
+    "notes": "Inbound fee for shipment inb-1746875952822",
+    "amount": 1195,
+    "id": "txn-1746876046106",
+    "date": "2025-05-10"
+  }
+]

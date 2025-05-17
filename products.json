@@ -1,0 +1,40 @@
+[
+  {
+    "name": "pads",
+    "sku": "p12",
+    "category": "sanitary",
+    "price": 200,
+    "cost": 200,
+    "description": "",
+    "imageUrl": "",
+    "packingType": "normal packing",
+    "lengthCm": "10",
+    "breadthCm": "10",
+    "heightCm": "19.91",
+    "weightKg": 0.3,
+    "packingPrice": 0,
+    "inboundPrice": 0,
+    "outboundPrice": 0,
+    "id": "1746876151347",
+    "merchantId": "merchant-1746876084262"
+  },
+  {
+    "name": "bottle",
+    "sku": "b14",
+    "category": "drinks",
+    "price": 300,
+    "cost": 300,
+    "description": "",
+    "imageUrl": "",
+    "packingType": "eco friendly fragile packing",
+    "lengthCm": "30",
+    "breadthCm": "10",
+    "heightCm": "10",
+    "weightKg": 0.4,
+    "packingPrice": 0,
+    "inboundPrice": 0,
+    "outboundPrice": 0,
+    "id": "1746875660474",
+    "merchantId": "merchant-1746860457946"
+  }
+]

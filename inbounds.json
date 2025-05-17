@@ -1,0 +1,37 @@
+[
+  {
+    "id": "inb-1746876175784",
+    "merchantId": "merchant-1746876084262",
+    "items": [
+      {
+        "productId": "1746876151347",
+        "quantity": 500
+      }
+    ],
+    "totalWeightKg": 199.1,
+    "pickupLocation": "98, hjgiuhj, 879879",
+    "deliveryLocation": "",
+    "type": "inbound",
+    "status": "pending",
+    "fee": 1995,
+    "date": "2025-05-10"
+  },
+  {
+    "id": "inb-1746875952822",
+    "merchantId": "merchant-1746860457946",
+    "items": [
+      {
+        "productId": "1746875660474",
+        "quantity": 199
+      }
+    ],
+    "totalWeightKg": 119.39999999999999,
+    "pickupLocation": "47N, OIDJDOIWEJD, 989083",
+    "deliveryLocation": "",
+    "type": "inbound",
+    "status": "completed",
+    "fee": 1195,
+    "date": "2025-05-10",
+    "receivedDate": "2025-05-10"
+  }
+]

@@ -1,0 +1,11 @@
+[
+  {
+    "id": "inv-1746876046105",
+    "merchantId": "merchant-1746860457946",
+    "productId": "1746875660474",
+    "quantity": 199,
+    "location": "Default Warehouse",
+    "minStockLevel": 0,
+    "maxStockLevel": 0
+  }
+]
