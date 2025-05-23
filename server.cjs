@@ -814,6 +814,21 @@ app.get('/debug/user-password', async (req, res) => {
   }
 });
 
+// DELETE endpoint to delete a user by id
+app.delete('/api/users/:id', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const deletedUser = await User.findOneAndDelete({ id });
+    if (!deletedUser) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json({ message: 'User deleted' });
+  } catch (err) {
+    console.error('Error deleting user:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
