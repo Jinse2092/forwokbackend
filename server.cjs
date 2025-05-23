@@ -10,7 +10,12 @@ const multer = require('multer');
 const app = express();
 const PORT = 4000;
 
-app.use(cors());
+// CORS setup to explicitly allow all methods
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
 app.use(bodyParser.json());
 
 // MongoDB connection
