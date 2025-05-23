@@ -612,10 +612,10 @@ async function sendOtpEmail(email, otp) {
   });
 
   const mailOptions = {
-    from: `"Your App" <${process.env.GMAIL_USER}>`,
+    from: `"FORVOQ" <${process.env.GMAIL_USER}>`,
     to: email,
-    subject: 'Your OTP Code',
-    text: `Your OTP code is ${otp}`,
+    subject: 'FORVOQ OTP Code – Complete Your Verification',
+    text: `Hi there,\n\nWelcome to FORVOQ – your trusted partner in e-commerce fulfillment.\n\nTo proceed with your verification, please use the One-Time Password (OTP) below. This code is valid for the next 10 minutes.\n\n🔐 Your OTP Code: ${otp}\n\nIf you did not request this, please ignore this email. For your account’s security, do not share this code with anyone.\n\nNeed help? Reach out to our support team at support@forvoq.com or visit our Help Center.\n\nThank you for choosing FORVOQ.\n– The FORVOQ Team`,
   };
 
   try {
