@@ -134,6 +134,21 @@ app.get('/api/users', async (req, res) => {
   }
 });
 
+// GET endpoint to retrieve a user by id
+app.get('/api/users/:id', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const user = await User.findOne({ id });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    res.json(user);
+  } catch (err) {
+    console.error('Error fetching user by id:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Example: GET endpoint for payments using MongoDB
 app.get('/api/received-payments', async (req, res) => {
   try {
