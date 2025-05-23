@@ -814,8 +814,30 @@ app.get('/debug/user-password', async (req, res) => {
   }
 });
 
-// DELETE endpoint to delete a user by id
-app.delete('/api/users/:id', async (req, res) => {
+// Middleware to authenticate and authorize superadmin
+function authenticateSuperadmin(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) {
+    return res.status(401).json({ error: 'Authorization header missing' });
+  }
+  const token = authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Token missing' });
+  }
+  jwt.verify(token, process.env.JWT_SECRET || 'defaultsecret', (err, decoded) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid or expired token' });
+    }
+    if (!decoded || decoded.role !== 'superadmin') {
+      return res.status(403).json({ error: 'Forbidden: Superadmin only' });
+    }
+    req.user = decoded;
+    next();
+  });
+}
+
+// DELETE endpoint to delete a user by id (superadmin only)
+app.delete('/api/users/:id', authenticateSuperadmin, async (req, res) => {
   const id = req.params.id;
   try {
     const deletedUser = await User.findOneAndDelete({ id });
