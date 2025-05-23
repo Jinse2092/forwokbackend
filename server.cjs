@@ -110,7 +110,7 @@ app.post('/api/users', async (req, res) => {
     const hashedPassword = await bcrypt.hash(userData.password, 10);
     // Create new user
     const newUser = new User({
-      id: `user-${Date.now()}`,
+      id: userData.role === 'admin' ? 'admin-' + Date.now() : `user-${Date.now()}`,
       role: userData.role || 'merchant',
       ...userData,
       password: hashedPassword,
