@@ -13,7 +13,7 @@ const PORT = 4000;
 // CORS setup to explicitly allow all methods
 app.use(cors({
   origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], // Added PATCH
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(bodyParser.json());
@@ -449,6 +449,42 @@ app.delete('/api/inventory/:id', async (req, res) => {
   }
 });
 
+// PATCH endpoint to partially update inventory item
+app.patch('/api/inventory/:id', async (req, res) => {
+  const id = req.params.id;
+  const updateFields = req.body;
+  try {
+    const updatedInventory = await Inventory.findOneAndUpdate(
+      { id },
+      { $set: updateFields },
+      { new: true }
+    );
+    if (!updatedInventory) return res.status(404).json({ error: 'Inventory item not found' });
+    res.json(updatedInventory);
+  } catch (err) {
+    console.error('Error patching inventory:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Create inventory item with specific id if not exists
+app.post('/api/inventory/:id', async (req, res) => {
+  const id = req.params.id;
+  const data = req.body;
+  try {
+    const existing = await Inventory.findOne({ id });
+    if (existing) {
+      return res.status(409).json({ error: 'Inventory item already exists' });
+    }
+    const newInventory = new Inventory({ ...data, id });
+    await newInventory.save();
+    res.status(201).json(newInventory);
+  } catch (err) {
+    console.error('Error creating inventory item:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // CRUD endpoints for transactions
 app.get('/api/transactions', async (req, res) => {
   try {
@@ -852,6 +888,30 @@ app.delete('/api/users/:id', authenticateSuperadmin, async (req, res) => {
     res.json({ message: 'User deleted' });
   } catch (err) {
     console.error('Error deleting user:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Decrement inventory quantity endpoint
+app.post('/api/inventory/:id/decrement', async (req, res) => {
+  const id = req.params.id;
+  const { quantity } = req.body;
+  if (typeof quantity !== 'number' || quantity <= 0) {
+    return res.status(400).json({ error: 'Quantity to decrement must be a positive number' });
+  }
+  try {
+    const inventoryItem = await Inventory.findOne({ id });
+    if (!inventoryItem) {
+      return res.status(404).json({ error: 'Inventory item not found' });
+    }
+    if (typeof inventoryItem.quantity !== 'number' || inventoryItem.quantity < quantity) {
+      return res.status(400).json({ error: 'Not enough stock to decrement' });
+    }
+    inventoryItem.quantity -= quantity;
+    await inventoryItem.save();
+    res.json(inventoryItem);
+  } catch (err) {
+    console.error('Error decrementing inventory:', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
