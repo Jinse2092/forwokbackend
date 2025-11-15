@@ -12,9 +12,10 @@ const PORT = 4000;
 
 // CORS setup to explicitly allow all methods
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'], // Added PATCH
+  origin: ['https://app.forvoq.com', 'http://localhost:3000'], // Updated for production
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
 app.use(bodyParser.json());
 
@@ -67,8 +68,14 @@ const orderSchema = new mongoose.Schema({
   status: String,
   date: { type: String, default: '' }, // Store date as string YYYY-MM-DD
   time: { type: String, default: '' }, // Store time as string HH:mm:ss
+  // Timestamps for lifecycle events (ISO strings)
+  packedAt: { type: String, default: '' },
+  dispatchedAt: { type: String, default: '' },
+  deliveredAt: { type: String, default: '' },
+  // Courier/delivery partner name provided at creation or edit
+  deliveryPartner: { type: String, default: '' },
   shippingLabelBase64: String, // Store base64 encoded PDF
-});
+}, { strict: false }); // Allow extra fields in case of backwards compatibility
 
 const Order = mongoose.model('Order', orderSchema);
 
@@ -218,6 +225,7 @@ async function fetchISTDateTime() {
 
 app.post('/api/orders', async (req, res) => {
   const orderData = req.body;
+  console.log('POST /api/orders - Received order data:', JSON.stringify(orderData, null, 2));
   if (!orderData.id) {
     return res.status(400).json({ error: 'Order id is required' });
   }
@@ -231,12 +239,42 @@ app.post('/api/orders', async (req, res) => {
     if (existingOrder) {
       return res.status(409).json({ error: 'Order with this id already exists' });
     }
-    const newOrder = new Order(orderData);
-    await newOrder.save();
-    res.status(201).json(newOrder);
+    
+    // Explicitly ensure all fields are present with defaults
+    const completeOrderData = {
+      id: orderData.id,
+      merchantId: orderData.merchantId,
+      customerName: orderData.customerName || '',
+      address: orderData.address || '',
+      city: orderData.city || '',
+      state: orderData.state || '',
+      pincode: orderData.pincode || '',
+      phone: orderData.phone || '',
+      items: orderData.items || [],
+      status: orderData.status || 'pending',
+      date: orderData.date || '',
+      time: orderData.time || '',
+      packedAt: orderData.packedAt || '',
+      dispatchedAt: orderData.dispatchedAt || '',
+      deliveredAt: orderData.deliveredAt || '',
+      deliveryPartner: orderData.deliveryPartner || '',
+      shippingLabelBase64: orderData.shippingLabelBase64 || '',
+    };
+    
+    console.log('POST /api/orders - Complete order data to save:', JSON.stringify(completeOrderData, null, 2));
+    
+    const newOrder = new Order(completeOrderData);
+    const savedOrder = await newOrder.save();
+    console.log('POST /api/orders - Saved order to DB:', JSON.stringify(savedOrder.toObject(), null, 2));
+    
+    // Verify the saved document includes all fields
+    const verifyOrder = await Order.findOne({ id: orderData.id });
+    console.log('POST /api/orders - Verification from DB:', JSON.stringify(verifyOrder.toObject(), null, 2));
+    
+    res.status(201).json(verifyOrder);
   } catch (err) {
     console.error('Error saving order:', err);
-    res.status(500).json({ error: 'Internal Server Error' });
+    res.status(500).json({ error: 'Internal Server Error', details: err.message });
   }
 });
 
@@ -251,23 +289,102 @@ app.get('/api/orders', async (req, res) => {
   }
 });
 
+// DEBUG: Get a specific order by ID to check all fields
+app.get('/api/orders-debug/:id', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const order = await Order.findOne({ id });
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found', searchedId: id });
+    }
+    const orderObj = order.toObject();
+    console.log(`DEBUG: Order ${id} from MongoDB:`, JSON.stringify(orderObj, null, 2));
+    res.json({
+      message: 'Order found',
+      order: orderObj,
+      deliveryPartnerExists: 'deliveryPartner' in orderObj,
+      deliveryPartnerValue: orderObj.deliveryPartner,
+      allKeys: Object.keys(orderObj)
+    });
+  } catch (err) {
+    console.error(`Error fetching debug order ${id}:`, err);
+    res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
 // PUT endpoint to update an order by id
 app.put('/api/orders/:id', async (req, res) => {
   const id = req.params.id;
   const updatedData = req.body;
-  console.log(`PUT /api/orders/${id} called with data:`, updatedData);
+  console.log(`PUT /api/orders/${id} called with data:`, JSON.stringify(updatedData, null, 2));
   if (updatedData.id && updatedData.id !== id) {
     return res.status(400).json({ error: 'ID in URL and body do not match' });
   }
   try {
-    const updatedOrder = await Order.findOneAndUpdate({ id }, updatedData, { new: true });
-    if (!updatedOrder) {
+    // Fetch existing order first
+    const existingOrder = await Order.findOne({ id });
+    if (!existingOrder) {
       console.log(`Order with id ${id} not found`);
       return res.status(404).json({ error: 'Order not found' });
     }
+    
+    console.log(`PUT /api/orders/${id} - Existing order before update:`, JSON.stringify(existingOrder.toObject(), null, 2));
+    
+    // Merge updates with existing order to preserve all fields
+    const existingObj = existingOrder.toObject();
+    const mergedData = {
+      ...existingObj,
+      ...updatedData,
+      // Explicitly preserve ID
+      id: id,
+    };
+    delete mergedData._id;
+    
+    console.log(`PUT /api/orders/${id} - Merged data to update:`, JSON.stringify(mergedData, null, 2));
+    
+    // Use updateOne with explicit update operator for clarity
+    const result = await Order.updateOne(
+      { id },
+      { $set: mergedData },
+      { runValidators: true }
+    );
+    
+    console.log(`PUT /api/orders/${id} - UpdateOne result:`, result);
+    
+    // Fetch the updated document to return
+    const updatedOrder = await Order.findOne({ id });
+    console.log(`PUT /api/orders/${id} - Updated order from DB:`, JSON.stringify(updatedOrder.toObject(), null, 2));
+    
+    if (!updatedOrder) {
+      return res.status(404).json({ error: 'Order not found after update' });
+    }
+    
     res.json(updatedOrder);
   } catch (err) {
     console.error('Error updating order:', err);
+    res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+// Add DELETE endpoint to remove an order by id
+app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
+  const id = req.params.id;
+  console.log(`DELETE /api/orders/${id} called by user: ${req.user?.id} (${req.user?.role})`);
+  try {
+    const order = await Order.findOne({ id });
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    // Allow if requester is admin/superadmin or the merchant who owns the order
+    const requester = req.user || {};
+    if (requester.role === 'admin' || requester.role === 'superadmin' || (requester.role === 'merchant' && requester.id === order.merchantId)) {
+      await Order.findOneAndDelete({ id });
+      // Optionally, also remove related transactions or perform cleanup here
+      return res.json({ message: 'Order deleted', id });
+    }
+    return res.status(403).json({ error: 'Forbidden: insufficient permissions to delete order' });
+  } catch (err) {
+    console.error('Error deleting order:', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -352,6 +469,45 @@ const savedPickupLocationSchema = new mongoose.Schema({
   phone: String,
 });
 const SavedPickupLocation = mongoose.model('SavedPickupLocation', savedPickupLocationSchema);
+
+// Shipping Template schema and model
+const shippingTemplateSchema = new mongoose.Schema({
+  merchantId: { type: String, required: true, unique: true },
+  template: { type: String, default: '' },
+  updatedAt: { type: Date, default: Date.now }
+});
+const ShippingTemplate = mongoose.model('ShippingTemplate', shippingTemplateSchema);
+
+// GET shipping template for merchant
+app.get('/api/merchants/:id/shipping-template', async (req, res) => {
+  const id = req.params.id;
+  try {
+    const doc = await ShippingTemplate.findOne({ merchantId: id });
+    // Return 200 with empty template when not found to avoid noisy 404 in the frontend console.
+    if (!doc) return res.json({ template: '', updatedAt: null });
+    return res.json({ template: doc.template, updatedAt: doc.updatedAt });
+  } catch (err) {
+    console.error('Error fetching shipping template:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// PUT (create/update) shipping template for merchant
+app.put('/api/merchants/:id/shipping-template', async (req, res) => {
+  const id = req.params.id;
+  const { template } = req.body || {};
+  try {
+    const updated = await ShippingTemplate.findOneAndUpdate(
+      { merchantId: id },
+      { template: template || '', updatedAt: new Date() },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+    return res.json({ template: updated.template, updatedAt: updated.updatedAt });
+  } catch (err) {
+    console.error('Error saving shipping template:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
 
 // CRUD endpoints for products
 app.get('/api/products', async (req, res) => {
@@ -803,6 +959,18 @@ app.post('/api/forgot-password/reset-password', async (req, res) => {
 
 const jwt = require('jsonwebtoken');
 
+// Middleware to verify JWT and attach user to request
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader) return res.status(401).json({ error: 'Authorization header missing' });
+  const token = authHeader.split(' ')[1];
+  if (!token) return res.status(401).json({ error: 'Token missing' });
+  jwt.verify(token, process.env.JWT_SECRET || 'defaultsecret', (err, decoded) => {
+    if (err) return res.status(403).json({ error: 'Invalid or expired token' });
+    req.user = decoded;
+    next();
+  });
+}
 
 // POST /login endpoint
 app.post('/login', async (req, res) => {
@@ -830,7 +998,9 @@ app.post('/login', async (req, res) => {
       role: user.role,
       companyName: user.companyName,
     };
-    res.json({ message: 'Login successful', user: userInfo });
+    // Sign a JWT so clients can authenticate subsequent requests
+    const token = jwt.sign({ id: user.id, role: user.role }, process.env.JWT_SECRET || 'defaultsecret', { expiresIn: '8h' });
+    res.json({ message: 'Login successful', user: userInfo, token });
   } catch (err) {
     console.error('Error during login:', err);
     res.status(500).json({ error: 'Internal Server Error' });

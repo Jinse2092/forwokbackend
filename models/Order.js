@@ -18,6 +18,13 @@ const orderSchema = new mongoose.Schema({
   ],
   status: String,
   date: String,
+  time: String,
+  // Lifecycle timestamps
+  packedAt: String,
+  dispatchedAt: String,
+  deliveredAt: String,
+  // Courier/delivery partner
+  deliveryPartner: String,
   shippingLabelBase64: String,
 });
 
