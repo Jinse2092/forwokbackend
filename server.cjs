@@ -1,4 +1,9 @@
 require('dotenv').config();
+
+// WARNING: Storing credentials in source is insecure. These values are set for local testing only.
+// Recommended: use environment variables or a secrets manager in production.
+process.env.GMAIL_USER = process.env.GMAIL_USER || 'forvoq@gmail.com';
+process.env.GMAIL_PASS = process.env.GMAIL_PASS || 'awgruswxpbrmvooz';
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -12,7 +17,7 @@ const PORT = 4000;
 
 // CORS setup to explicitly allow all methods
 app.use(cors({
-  origin: ['https://app.forvoq.com', 'http://localhost:3000'], // Updated for production
+  origin: ['http://localhost:5173', 'http://localhost:3000'], // Updated for production
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
@@ -65,6 +70,8 @@ const orderSchema = new mongoose.Schema({
       quantity: Number,
     }
   ],
+  // Tracking code for courier
+  trackingCode: { type: String, default: '' },
   status: String,
   date: { type: String, default: '' }, // Store date as string YYYY-MM-DD
   time: { type: String, default: '' }, // Store time as string HH:mm:ss
@@ -259,6 +266,9 @@ app.post('/api/orders', async (req, res) => {
       deliveredAt: orderData.deliveredAt || '',
       deliveryPartner: orderData.deliveryPartner || '',
       shippingLabelBase64: orderData.shippingLabelBase64 || '',
+        trackingCode: orderData.trackingCode !== undefined ? orderData.trackingCode : '',
+      // Accept packedweight if provided (allows storing frontend-entered packed weight)
+      packedweight: orderData.packedweight !== undefined ? orderData.packedweight : (orderData.totalWeightKg || ''),
     };
     
     console.log('POST /api/orders - Complete order data to save:', JSON.stringify(completeOrderData, null, 2));
@@ -317,49 +327,63 @@ app.put('/api/orders/:id', async (req, res) => {
   const id = req.params.id;
   const updatedData = req.body;
   console.log(`PUT /api/orders/${id} called with data:`, JSON.stringify(updatedData, null, 2));
+
   if (updatedData.id && updatedData.id !== id) {
     return res.status(400).json({ error: 'ID in URL and body do not match' });
   }
+
   try {
-    // Fetch existing order first
+    // Fetch the existing order
     const existingOrder = await Order.findOne({ id });
     if (!existingOrder) {
       console.log(`Order with id ${id} not found`);
       return res.status(404).json({ error: 'Order not found' });
     }
-    
+
     console.log(`PUT /api/orders/${id} - Existing order before update:`, JSON.stringify(existingOrder.toObject(), null, 2));
-    
-    // Merge updates with existing order to preserve all fields
-    const existingObj = existingOrder.toObject();
-    const mergedData = {
-      ...existingObj,
-      ...updatedData,
-      // Explicitly preserve ID
-      id: id,
-    };
-    delete mergedData._id;
-    
-    console.log(`PUT /api/orders/${id} - Merged data to update:`, JSON.stringify(mergedData, null, 2));
-    
-    // Use updateOne with explicit update operator for clarity
-    const result = await Order.updateOne(
-      { id },
-      { $set: mergedData },
-      { runValidators: true }
-    );
-    
-    console.log(`PUT /api/orders/${id} - UpdateOne result:`, result);
-    
-    // Fetch the updated document to return
-    const updatedOrder = await Order.findOne({ id });
-    console.log(`PUT /api/orders/${id} - Updated order from DB:`, JSON.stringify(updatedOrder.toObject(), null, 2));
-    
-    if (!updatedOrder) {
-      return res.status(404).json({ error: 'Order not found after update' });
+
+    // Update the order fields. Use explicit undefined checks so falsy but present values are saved.
+    if (updatedData.trackingCode !== undefined) existingOrder.trackingCode = updatedData.trackingCode;
+    if (updatedData.customerName !== undefined) existingOrder.customerName = updatedData.customerName;
+    if (updatedData.address !== undefined) existingOrder.address = updatedData.address;
+    if (updatedData.city !== undefined) existingOrder.city = updatedData.city;
+    if (updatedData.state !== undefined) existingOrder.state = updatedData.state;
+    if (updatedData.pincode !== undefined) existingOrder.pincode = updatedData.pincode;
+    if (updatedData.phone !== undefined) existingOrder.phone = updatedData.phone;
+    if (updatedData.status !== undefined) existingOrder.status = updatedData.status;
+    if (updatedData.items !== undefined) existingOrder.items = updatedData.items;
+    // Persist total weight and packed timestamp if provided (allow zero values)
+    if (updatedData.totalWeightKg !== undefined) existingOrder.totalWeightKg = updatedData.totalWeightKg;
+    // Persist packedweight if provided
+    if (updatedData.packedweight !== undefined) existingOrder.packedweight = updatedData.packedweight;
+    if (updatedData.packedAt !== undefined) existingOrder.packedAt = updatedData.packedAt;
+    // Persist dispatch/delivery timestamps if provided
+    if (updatedData.dispatchedAt !== undefined) {
+      console.log(`PUT /api/orders/${id} - received dispatchedAt:`, updatedData.dispatchedAt, typeof updatedData.dispatchedAt);
+      existingOrder.dispatchedAt = updatedData.dispatchedAt;
+      console.log(`PUT /api/orders/${id} - existingOrder.dispatchedAt after set:`, existingOrder.dispatchedAt);
     }
-    
-    res.json(updatedOrder);
+    if (updatedData.dispatchDate !== undefined) {
+      console.log(`PUT /api/orders/${id} - received dispatchDate:`, updatedData.dispatchDate);
+      existingOrder.dispatchDate = updatedData.dispatchDate;
+    }
+    if (updatedData.deliveredAt !== undefined) {
+      console.log(`PUT /api/orders/${id} - received deliveredAt:`, updatedData.deliveredAt);
+      existingOrder.deliveredAt = updatedData.deliveredAt;
+    }
+
+    console.log(`PUT /api/orders/${id} - Fields after applying updates:`, JSON.stringify({
+      trackingCode: existingOrder.trackingCode,
+      totalWeightKg: existingOrder.totalWeightKg,
+      packedAt: existingOrder.packedAt,
+      status: existingOrder.status
+    }, null, 2));
+
+    // Save the updated order
+    const savedOrder = await existingOrder.save();
+    console.log(`PUT /api/orders/${id} - Updated order saved:`, JSON.stringify(savedOrder.toObject(), null, 2));
+
+    res.json(savedOrder);
   } catch (err) {
     console.error('Error updating order:', err);
     res.status(500).json({ error: 'Internal Server Error', details: err.message });
@@ -732,7 +756,7 @@ app.post('/api/savedPickupLocations', async (req, res) => {
     state,
     pincode,
     phone
-  } = req.body;
+  } = req.body || {};
   try {
     const newLocation = new SavedPickupLocation({
       id,
@@ -765,7 +789,7 @@ app.put('/api/savedPickupLocations/:id', async (req, res) => {
     state,
     pincode,
     phone
-  } = req.body;
+  } = req.body || {};
   try {
     const updatedLocation = await SavedPickupLocation.findOneAndUpdate(
       { id },
@@ -841,7 +865,7 @@ async function sendOtpEmail(email, otp) {
 
 // POST /api/forgot-password/request-otp
 app.post('/api/forgot-password/request-otp', async (req, res) => {
-  const { email, merchantId, phone } = req.body;
+  const { email, merchantId, phone } = req.body || {};
   if (!email && !merchantId && !phone) {
     return res.status(400).json({ error: 'Provide email, merchantId, or phone' });
   }
@@ -874,7 +898,7 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
 
 // POST /api/register/request-otp
 app.post('/api/register/request-otp', async (req, res) => {
-  const { email } = req.body;
+  const { email } = req.body || {};
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
   }
@@ -892,7 +916,7 @@ app.post('/api/register/request-otp', async (req, res) => {
 
 // POST /api/register/verify-otp
 app.post('/api/register/verify-otp', (req, res) => {
-  const { email, otp } = req.body;
+  const { email, otp } = req.body || {};
   if (!email || !otp) {
     return res.status(400).json({ error: 'Email and OTP are required' });
   }
@@ -914,7 +938,7 @@ app.post('/api/register/verify-otp', (req, res) => {
 
 // POST /api/forgot-password/verify-otp
 app.post('/api/forgot-password/verify-otp', (req, res) => {
-  const { userId, otp } = req.body;
+  const { userId, otp } = req.body || {};
   if (!userId || !otp) {
     return res.status(400).json({ error: 'userId and otp are required' });
   }
@@ -936,7 +960,7 @@ app.post('/api/forgot-password/verify-otp', (req, res) => {
 
 // POST /api/forgot-password/reset-password
 app.post('/api/forgot-password/reset-password', async (req, res) => {
-  const { userId, newPassword } = req.body;
+  const { userId, newPassword } = req.body || {};
   if (!userId || !newPassword) {
     return res.status(400).json({ error: 'userId and newPassword are required' });
   }
@@ -974,7 +998,7 @@ function authenticateToken(req, res, next) {
 
 // POST /login endpoint
 app.post('/login', async (req, res) => {
-  const { email, password } = req.body;
+  const { email, password } = req.body || {};
   console.log('Login attempt for email:', email);
   if (!email || !password) {
     console.log('Missing email or password');
@@ -1065,7 +1089,7 @@ app.delete('/api/users/:id', authenticateSuperadmin, async (req, res) => {
 // Decrement inventory quantity endpoint
 app.post('/api/inventory/:id/decrement', async (req, res) => {
   const id = req.params.id;
-  const { quantity } = req.body;
+  const { quantity } = req.body || {};
   if (typeof quantity !== 'number' || quantity <= 0) {
     return res.status(400).json({ error: 'Quantity to decrement must be a positive number' });
   }
@@ -1085,6 +1109,39 @@ app.post('/api/inventory/:id/decrement', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
+
+// PATCH endpoint to update tracking code for an order
+app.patch('/api/orders/:id/tracking-code', async (req, res) => {
+  console.log(`PATCH request received for /api/orders/${req.params.id}/tracking-code`);
+  const id = req.params.id;
+  // Accept trackingCode even if empty string; ensure property exists in body
+  const hasTrackingCodeProp = Object.prototype.hasOwnProperty.call(req.body, 'trackingCode');
+  if (!hasTrackingCodeProp) {
+    console.log('Tracking code property is missing in the request body');
+    return res.status(400).json({ error: 'trackingCode property is required in body' });
+  }
+  const { trackingCode } = req.body;
+
+  try {
+    const order = await Order.findOne({ id });
+    if (!order) {
+      console.log(`Order with id ${id} not found`);
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Update the tracking code and re-query to ensure latest doc is returned
+    order.trackingCode = trackingCode;
+    await order.save();
+    const saved = await Order.findOne({ id });
+    console.log(`Tracking code updated successfully for order ${id}`, { trackingCode: saved && saved.trackingCode });
+    res.json({ message: 'Tracking code updated successfully', order: saved });
+  } catch (err) {
+    console.error('Error updating tracking code:', err);
+    res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+// NOTE: POST /api/orders/:id/tracking-code removed — use PATCH /api/orders/:id/tracking-code or PUT /api/orders/:id
 
 // Start server
 app.listen(PORT, () => {
