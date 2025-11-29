@@ -17,7 +17,7 @@ const PORT = 4000;
 
 // CORS setup to explicitly allow all methods
 app.use(cors({
-  origin: ['http://localhost:5173', 'http://localhost:3000'], // Updated for production
+  origin: ['https://app.forvoq.com', 'http://localhost:3000'], // Updated for production
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
