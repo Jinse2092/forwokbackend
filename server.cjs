@@ -19,7 +19,8 @@ const PORT = 4000;
 app.use(cors({
   origin: ['https://app.forvoq.com','http://localhost:5173'], // Updated for production
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  // Allow the admin upload secret header so frontend can call protected admin endpoints
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-upload-secret'],
   credentials: true
 }));
 app.use(bodyParser.json());
@@ -137,6 +138,109 @@ app.post('/upload', upload.single('file'), (req, res) => {
   }
   // Optionally, save file metadata to MongoDB here
   res.status(201).json({ message: 'File uploaded successfully', filename: req.file.filename });
+});
+
+// Admin restore endpoint: accepts a zip file containing JSON files per collection.
+// It will skip restoring the `users` collection and any keys matching the preserve regex.
+app.post('/api/admin/restore-zip', upload.single('file'), async (req, res) => {
+  try {
+    // simple auth: check secret header
+    const provided = req.get('x-admin-upload-secret');
+    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+      return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
+    }
+
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+
+    // Log upload info for debugging
+    console.log('/api/admin/restore-zip called by', req.ip, 'uploaded file:', req.file && req.file.filename);
+    const JSZip = require('jszip');
+    const buffer = require('fs').readFileSync(req.file.path);
+    const zip = await JSZip.loadAsync(buffer);
+    // List zip contents for debugging
+    try {
+      const fileNames = Object.keys(zip.files);
+      console.log('Uploaded zip contains files:', fileNames);
+    } catch (zerr) {
+      console.warn('Could not list zip contents', zerr && zerr.message);
+    }
+
+    // Map file key names to mongoose models available in this file
+    const modelMap = {
+      products: Product,
+      inventory: Inventory,
+      transactions: Transaction,
+      orders: Order,
+      inbounds: Inbound,
+      users: User,
+      savedPickupLocations: SavedPickupLocation,
+      payments: Payment,
+      packingFees: PackingFee,
+      shippingTemplates: ShippingTemplate
+    };
+
+    const preserveRegex = /user|auth|session|currentUser|token/i;
+    const results = { restored: [], skipped: [], errors: [] };
+
+    const entries = Object.keys(zip.files).filter(n => n.endsWith('.json'));
+    for (const name of entries) {
+      try {
+        const content = await zip.file(name).async('string');
+        const parts = name.split('/');
+        const filename = parts[parts.length - 1];
+        const key = filename.replace(/\.json$/i, '');
+
+        if (key === 'users' || preserveRegex.test(key)) {
+          results.skipped.push(key);
+          continue;
+        }
+
+        let parsed;
+        try { parsed = JSON.parse(content); } catch (e) { parsed = null; }
+        if (!parsed) {
+          results.errors.push({ key, error: 'Invalid JSON' });
+          continue;
+        }
+
+        const Model = modelMap[key];
+        if (!Model) {
+          // unknown key: save to uploads folder as a JSON file for manual inspection
+          const outPath = path.join(uploadDir, `${Date.now()}-${filename}`);
+          fs.writeFileSync(outPath, JSON.stringify(parsed, null, 2));
+          results.restored.push({ key, note: 'saved-to-uploads' });
+          continue;
+        }
+
+        // Replace collection contents: remove existing docs then insert provided docs
+        if (Array.isArray(parsed)) {
+          await Model.deleteMany({});
+          if (parsed.length > 0) {
+            await Model.insertMany(parsed, { ordered: false });
+          }
+          results.restored.push(key);
+        } else if (typeof parsed === 'object') {
+          // If object with keys, attempt to insert as single doc after clearing
+          await Model.deleteMany({});
+          await Model.create(parsed);
+          results.restored.push(key);
+        } else {
+          results.errors.push({ key, error: 'Unsupported JSON shape' });
+        }
+      } catch (err) {
+        console.error('Restore entry error', name, err);
+        results.errors.push({ name, error: err.message });
+      }
+    }
+
+    // cleanup uploaded temp file
+    try { fs.unlinkSync(req.file.path); } catch (e) {}
+
+    return res.json({ message: 'Restore processed', results });
+  } catch (err) {
+    console.error('Restore zip error:', err && (err.stack || err));
+    // In development return stack for debugging; in production remove stack exposure
+    return res.status(500).json({ error: 'Restore failed', details: err.message, stack: err.stack });
+  }
 });
 
 // POST endpoint to add a new user
@@ -384,6 +488,48 @@ app.post('/api/admin/backup-upload', async (req, res) => {
   } catch (err) {
     console.error('Backup upload error:', err);
     return res.status(500).json({ error: 'Failed to upload backup', details: err.message });
+  }
+});
+
+// Admin export endpoint: returns all main collections as a single JSON object
+app.get('/api/admin/export-all', async (req, res) => {
+  try {
+    const provided = req.get('x-admin-upload-secret');
+    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+      return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
+    }
+
+    const [products, inventory, transactions, orders, inbounds, users, locations, payments, packingFees, shippingTemplates] = await Promise.all([
+      Product.find().lean(),
+      Inventory.find().lean(),
+      Transaction.find().lean(),
+      Order.find().lean(),
+      Inbound.find().lean(),
+      User.find().lean(),
+      SavedPickupLocation.find().lean(),
+      Payment.find().lean(),
+      PackingFee.find().lean(),
+      ShippingTemplate.find().lean()
+    ]);
+
+    const exportObj = {
+      products,
+      inventory,
+      transactions,
+      orders,
+      inbounds,
+      users,
+      savedPickupLocations: locations,
+      payments,
+      packingFees,
+      shippingTemplates,
+      exportedAt: new Date().toISOString()
+    };
+
+    return res.json(exportObj);
+  } catch (err) {
+    console.error('Export all error:', err);
+    return res.status(500).json({ error: 'Failed to export data', details: err.message });
   }
 });
 
