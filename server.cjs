@@ -230,6 +230,16 @@ app.post('/api/received-payments', async (req, res) => {
 
 const ntpClient = require('ntp-client');
 
+// Google Drive server-side upload support
+// Uses a Service Account JSON which must be provided via environment variable
+// Do NOT commit service account keys to source control. Set the env var in production.
+let google;
+try {
+  google = require('googleapis').google;
+} catch (e) {
+  console.warn('googleapis not installed; server-side Drive upload endpoint will be unavailable. Run `npm install` in backend.');
+}
+
 async function fetchISTDateTime() {
   return new Promise((resolve, reject) => {
     ntpClient.getNetworkTime("time.google.com", 123, function(err, date) {
@@ -311,6 +321,69 @@ app.post('/api/orders', async (req, res) => {
   } catch (err) {
     console.error('Error saving order:', err);
     res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+/**
+ * Server-side endpoint to upload a backup JSON to an application-owned Google Drive
+ * Security: requires header `x-admin-upload-secret` to match `process.env.ADMIN_UPLOAD_SECRET`.
+ * The service account credentials JSON must be available in `process.env.GOOGLE_SERVICE_ACCOUNT_JSON`.
+ * Request body: { filename?: string, backup: <object> }
+ */
+app.post('/api/admin/backup-upload', async (req, res) => {
+  try {
+    // simple auth: check secret header
+    const provided = req.get('x-admin-upload-secret');
+    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+      return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
+    }
+
+    if (!google) return res.status(500).json({ error: 'Server not configured for Drive uploads (googleapis missing)' });
+
+    const saJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+    if (!saJson) return res.status(500).json({ error: 'Server misconfigured: missing GOOGLE_SERVICE_ACCOUNT_JSON' });
+
+    let credentials;
+    try {
+      credentials = typeof saJson === 'string' ? JSON.parse(saJson) : saJson;
+    } catch (e) {
+      console.error('Invalid GOOGLE_SERVICE_ACCOUNT_JSON:', e);
+      return res.status(500).json({ error: 'Invalid service account JSON' });
+    }
+
+    const auth = new google.auth.GoogleAuth({
+      credentials,
+      scopes: ['https://www.googleapis.com/auth/drive.file']
+    });
+
+    const drive = google.drive({ version: 'v3', auth });
+
+    const payload = req.body && req.body.backup ? req.body.backup : req.body;
+    if (!payload || (typeof payload === 'object' && Object.keys(payload).length === 0)) {
+      return res.status(400).json({ error: 'No backup payload provided' });
+    }
+
+    const jsonString = JSON.stringify(payload, null, 2);
+    const buffer = Buffer.from(jsonString, 'utf8');
+    const filename = req.body && req.body.filename ? String(req.body.filename) : `forvoq_backup_${new Date().toISOString().replace(/[:.]/g,'-')}.json`;
+
+    // Create file on Drive
+    const stream = require('stream');
+    const readable = new stream.Readable();
+    readable._read = () => {}; // _read is required but you can noop it
+    readable.push(buffer);
+    readable.push(null);
+
+    const response = await drive.files.create({
+      requestBody: { name: filename, mimeType: 'application/json' },
+      media: { mimeType: 'application/json', body: readable },
+      fields: 'id, name'
+    });
+
+    return res.status(201).json({ message: 'Backup uploaded to Drive', file: response.data });
+  } catch (err) {
+    console.error('Backup upload error:', err);
+    return res.status(500).json({ error: 'Failed to upload backup', details: err.message });
   }
 });
 
