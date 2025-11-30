@@ -17,7 +17,7 @@ const PORT = 4000;
 
 // CORS setup to explicitly allow all methods
 app.use(cors({
-  origin: ['https://app.forvoq.com', 'http://localhost:3000'], // Updated for production
+  origin: ['https://app.forvoq.com','http://localhost:3000'], // Updated for production
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true
@@ -85,6 +85,32 @@ const orderSchema = new mongoose.Schema({
 }, { strict: false }); // Allow extra fields in case of backwards compatibility
 
 const Order = mongoose.model('Order', orderSchema);
+
+// PackingFee schema and model - stores per-order packing breakdown
+const packingFeeSchema = new mongoose.Schema({
+  orderId: { type: String, required: true, unique: true },
+  merchantId: String,
+  items: [
+    {
+      productId: String,
+      name: String,
+      quantity: Number,
+      warehousingPerItem: Number,
+      transportationPerItem: Number,
+      itemPackingPerItem: Number,
+      estimatedTotalPerItem: Number,
+      lineTotal: Number
+    }
+  ],
+  trackingFee: { type: Number, default: 3 },
+  boxFee: { type: Number, default: 0 },
+  boxCutting: { type: Boolean, default: false },
+  totalPackingFee: { type: Number, default: 0 },
+  totalWeightKg: { type: Number, default: 0 },
+  updatedAt: { type: String, default: '' }
+}, { strict: false });
+
+const PackingFee = mongoose.model('PackingFee', packingFeeSchema);
 
 // Multer setup for file uploads
 const uploadDir = path.join(__dirname, 'uploads');
@@ -291,7 +317,24 @@ app.post('/api/orders', async (req, res) => {
 // GET endpoint to retrieve orders
 app.get('/api/orders', async (req, res) => {
   try {
-    const orders = await Order.find().sort({ date: -1 });
+    // Use aggregation to join packingfees so frontend gets server-authoritative totalPackingFee
+    const orders = await Order.aggregate([
+      { $sort: { date: -1 } },
+      { $lookup: {
+          from: 'packingfees',
+          localField: 'id',
+          foreignField: 'orderId',
+          as: 'pf'
+      } },
+      { $addFields: {
+          pf0: { $arrayElemAt: ['$pf', 0] }
+      } },
+      { $addFields: {
+          packingFee: { $cond: [{ $ifNull: ['$pf0.totalPackingFee', false] }, '$pf0.totalPackingFee', '$packingFee'] },
+          packingDetails: { $cond: [{ $ifNull: ['$pf0.items', false] }, '$pf0.items', '$packingDetails'] }
+      } },
+      { $project: { pf: 0, pf0: 0 } }
+    ]).exec();
     res.json(orders);
   } catch (err) {
     console.error('Error fetching orders:', err);
@@ -371,6 +414,28 @@ app.put('/api/orders/:id', async (req, res) => {
       console.log(`PUT /api/orders/${id} - received deliveredAt:`, updatedData.deliveredAt);
       existingOrder.deliveredAt = updatedData.deliveredAt;
     }
+    // Persist box fee and box cutting options
+    if (updatedData.boxFee !== undefined) {
+      existingOrder.boxFee = Number(updatedData.boxFee);
+    }
+    if (updatedData.boxCutting !== undefined) {
+      existingOrder.boxCutting = Boolean(updatedData.boxCutting);
+    }
+    // Persist trackingFee: use provided value if present, otherwise default to 3
+    if (updatedData.trackingFee !== undefined) {
+      existingOrder.trackingFee = Number(updatedData.trackingFee);
+    } else {
+      // Ensure there is always a trackingFee stored on the order; default to 3
+      existingOrder.trackingFee = 3;
+    }
+    // Persist packingFee if provided (total of item-level fees + box/tracking calculation)
+    if (updatedData.packingFee !== undefined) {
+      existingOrder.packingFee = Number(updatedData.packingFee);
+    }
+    // Persist packingDetails array if provided by the client
+    if (updatedData.packingDetails !== undefined) {
+      existingOrder.packingDetails = updatedData.packingDetails;
+    }
 
     console.log(`PUT /api/orders/${id} - Fields after applying updates:`, JSON.stringify({
       trackingCode: existingOrder.trackingCode,
@@ -383,6 +448,108 @@ app.put('/api/orders/:id', async (req, res) => {
     const savedOrder = await existingOrder.save();
     console.log(`PUT /api/orders/${id} - Updated order saved:`, JSON.stringify(savedOrder.toObject(), null, 2));
 
+    // Server-authoritative: when order is packed, compute per-item components and upsert PackingFee
+    try {
+      const shouldComputePacking = (String(savedOrder.status || '').toLowerCase() === 'packed') || (updatedData.packingFee !== undefined);
+      if (shouldComputePacking) {
+        // helpers
+        const calculateVolumetricWeight = (length, width, height) => {
+          const l = Number(length) || 0; const w = Number(width) || 0; const h = Number(height) || 0;
+          if (!l || !w || !h) return 0;
+          return (l * w * h) / 5000;
+        };
+        const calculateDispatchFee = (actualWeight, volumetricWeight, packingType) => {
+          const weight = Math.max(Number(actualWeight) || 0, Number(volumetricWeight) || 0);
+          let baseFee = 7;
+          let additionalFeePerHalfKg = 2;
+          switch ((packingType || '').toLowerCase()) {
+            case 'fragile packing': baseFee = 11; additionalFeePerHalfKg = 4; break;
+            case 'eco friendly fragile packing': baseFee = 12; additionalFeePerHalfKg = 5; break;
+            case 'normal packing':
+            default: baseFee = 7; additionalFeePerHalfKg = 2; break;
+          }
+          if (weight <= 0.5) return baseFee;
+          const additionalUnits = Math.ceil((weight - 0.5) / 0.5);
+          return baseFee + additionalUnits * additionalFeePerHalfKg;
+        };
+
+        const items = savedOrder.items || [];
+        let itemsPackingTotal = 0;
+        const pfItems = [];
+        for (const it of items) {
+          try {
+            let prod = null;
+            if (it && it.productId) {
+              prod = await Product.findOne({ id: it.productId });
+              if (!prod) {
+                try { prod = await Product.findById(it.productId); } catch (e) { prod = null; }
+              }
+            }
+            prod = prod || {};
+            const actual = Number(prod.weightKg || it.weightPerItemKg || 0);
+            const vol = calculateVolumetricWeight(prod.lengthCm || 0, prod.breadthCm || 0, prod.heightCm || 0);
+            const packing = (prod.itemPackingFee !== undefined && prod.itemPackingFee !== null && prod.itemPackingFee !== '')
+              ? Number(prod.itemPackingFee) || 0
+              : calculateDispatchFee(actual, vol, prod.packingType || 'normal packing');
+            const transportation = Number(prod.transportationFee || 0);
+            const warehousing = Number(prod.warehousingRatePerKg || 0) * (Number(prod.weightKg || actual || 0));
+            const perItemTotal = Number((packing + transportation + warehousing).toFixed(2));
+            const qty = Number(it.quantity || 0);
+            const lineTotal = Number((perItemTotal * qty).toFixed(2));
+            itemsPackingTotal += lineTotal;
+            pfItems.push({
+              productId: it.productId || '',
+              name: it.name || prod.name || '',
+              quantity: qty,
+              warehousingPerItem: Number(warehousing.toFixed(2)),
+              transportationPerItem: Number(transportation.toFixed(2)),
+              itemPackingPerItem: Number(packing.toFixed(2)),
+              estimatedTotalPerItem: perItemTotal,
+              lineTotal
+            });
+          } catch (innerErr) {
+            console.error('Error computing item fees for order', id, it, innerErr);
+          }
+        }
+
+          const boxFee = Number((updatedData.boxFee !== undefined ? updatedData.boxFee : savedOrder.boxFee) || 0);
+          const boxCutting = Boolean((updatedData.boxCutting !== undefined ? updatedData.boxCutting : savedOrder.boxCutting) || false);
+          const boxCuttingCharge = boxCutting ? 2 : 0;
+          const trackingFee = Number((updatedData.trackingFee !== undefined ? updatedData.trackingFee : (savedOrder.trackingFee !== undefined ? savedOrder.trackingFee : 3)) || 3);
+          const totalPackingFee = Number((itemsPackingTotal + boxFee + boxCuttingCharge + trackingFee).toFixed(2));
+
+        const pfDoc = {
+          orderId: id,
+          merchantId: savedOrder.merchantId,
+          items: pfItems,
+          trackingFee,
+          boxFee,
+          boxCutting,
+          totalPackingFee,
+          totalWeightKg: Number(savedOrder.totalWeightKg || savedOrder.packedweight || 0),
+          updatedAt: new Date().toISOString()
+        };
+
+        await PackingFee.findOneAndUpdate({ orderId: id }, pfDoc, { upsert: true, new: true });
+        console.log(`PUT /api/orders/${id} - PackingFee document computed & upserted for order ${id}`);
+
+        // Also persist server-calculated per-item breakdown onto the order for immediate client consumption
+        try {
+          savedOrder.packingDetails = pfItems;
+        } catch (e) {
+          console.warn('Failed to attach packingDetails to savedOrder object', e);
+        }
+
+        if (Number(savedOrder.packingFee || 0) !== totalPackingFee) {
+          savedOrder.packingFee = totalPackingFee;
+        }
+        // Save once with both packingFee and packingDetails
+        await savedOrder.save();
+        console.log(`PUT /api/orders/${id} - order.packingFee and packingDetails updated to server-calculated values (${totalPackingFee})`);
+      }
+    } catch (pfErr) {
+      console.error('Error computing/upserting PackingFee doc for order', id, pfErr);
+    }
     res.json(savedOrder);
   } catch (err) {
     console.error('Error updating order:', err);
@@ -547,7 +714,18 @@ app.get('/api/products', async (req, res) => {
 app.post('/api/products', async (req, res) => {
   const productData = req.body;
   try {
-    const newProduct = new Product(productData);
+    // Sanitize and normalize numeric fields to ensure schema consistency
+    const sanitized = {
+      ...productData,
+      price: productData.price === undefined || productData.price === null ? 0 : Number(productData.price),
+      cost: productData.cost === undefined || productData.cost === null ? 0 : Number(productData.cost),
+      weightKg: productData.weightKg === undefined || productData.weightKg === null ? 0 : Number(productData.weightKg),
+      transportationFee: productData.transportationFee === undefined || productData.transportationFee === null ? 0 : Number(productData.transportationFee),
+      itemPackingFee: productData.itemPackingFee === undefined || productData.itemPackingFee === null ? 0 : Number(productData.itemPackingFee),
+      warehousingRatePerKg: productData.warehousingRatePerKg === undefined || productData.warehousingRatePerKg === null ? 0 : Number(productData.warehousingRatePerKg),
+    };
+
+    const newProduct = new Product(sanitized);
     await newProduct.save();
     res.status(201).json(newProduct);
   } catch (err) {
@@ -560,7 +738,18 @@ app.put('/api/products/:id', async (req, res) => {
   const id = req.params.id;
   const updatedData = req.body;
   try {
-    const updatedProduct = await Product.findOneAndUpdate({ id }, updatedData, { new: true });
+    // Normalize numeric fields before updating
+    const updatePayload = {
+      ...updatedData,
+      ...(updatedData.price !== undefined && { price: Number(updatedData.price) }),
+      ...(updatedData.cost !== undefined && { cost: Number(updatedData.cost) }),
+      ...(updatedData.weightKg !== undefined && { weightKg: Number(updatedData.weightKg) }),
+      ...(updatedData.transportationFee !== undefined && { transportationFee: Number(updatedData.transportationFee) }),
+      ...(updatedData.itemPackingFee !== undefined && { itemPackingFee: Number(updatedData.itemPackingFee) }),
+      ...(updatedData.warehousingRatePerKg !== undefined && { warehousingRatePerKg: Number(updatedData.warehousingRatePerKg) }),
+    };
+
+    const updatedProduct = await Product.findOneAndUpdate({ id }, updatePayload, { new: true });
     if (!updatedProduct) return res.status(404).json({ error: 'Product not found' });
     res.json(updatedProduct);
   } catch (err) {
@@ -1142,6 +1331,62 @@ app.patch('/api/orders/:id/tracking-code', async (req, res) => {
 });
 
 // NOTE: POST /api/orders/:id/tracking-code removed — use PATCH /api/orders/:id/tracking-code or PUT /api/orders/:id
+
+// GET packing fee for a specific order by orderId
+app.get('/api/packingfees/:orderId', async (req, res) => {
+  const orderId = req.params.orderId;
+  try {
+    const pf = await PackingFee.findOne({ orderId });
+    if (!pf) return res.status(404).json({ error: 'PackingFee not found for orderId', orderId });
+    // Return minimal payload to the client
+    return res.json({
+      orderId: pf.orderId,
+      merchantId: pf.merchantId,
+      totalPackingFee: pf.totalPackingFee,
+      totalWeightKg: pf.totalWeightKg,
+      boxFee: pf.boxFee,
+      boxCutting: pf.boxCutting,
+      trackingFee: pf.trackingFee,
+      updatedAt: pf.updatedAt
+    });
+  } catch (err) {
+    console.error('Error fetching PackingFee for', orderId, err);
+    return res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+// Batch GET packing fees for multiple orderIds
+// Accepts either `?orderIds=ord-1,ord-2` or repeated `?orderId=ord-1&orderId=ord-2`
+app.get('/api/packingfees', async (req, res) => {
+  try {
+    let ids = [];
+    if (req.query.orderIds) {
+      ids = String(req.query.orderIds).split(',').map(s => s.trim()).filter(Boolean);
+    } else if (req.query.orderId) {
+      if (Array.isArray(req.query.orderId)) ids = req.query.orderId; else ids = [req.query.orderId];
+    }
+    if (!ids || ids.length === 0) return res.status(400).json({ error: 'orderIds query parameter is required' });
+    const docs = await PackingFee.find({ orderId: { $in: ids } });
+    // return mapping by orderId
+    const map = {};
+    docs.forEach(d => {
+      map[d.orderId] = {
+        orderId: d.orderId,
+        merchantId: d.merchantId,
+        totalPackingFee: d.totalPackingFee,
+        totalWeightKg: d.totalWeightKg,
+        boxFee: d.boxFee,
+        boxCutting: d.boxCutting,
+        trackingFee: d.trackingFee,
+        updatedAt: d.updatedAt
+      };
+    });
+    return res.json({ map });
+  } catch (err) {
+    console.error('Error fetching packingfees batch', err);
+    return res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
 
 // Start server
 app.listen(PORT, () => {

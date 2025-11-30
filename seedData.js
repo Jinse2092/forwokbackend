@@ -27,8 +27,8 @@ const seed = async () => {
 
     // Seed products
     const products = [
-      { id: 'prod-1', name: 'Product 1', merchantId: 'user-2', weightKg: 1, lengthCm: 10, breadthCm: 10, heightCm: 10, packingType: 'normal packing' },
-      { id: 'prod-2', name: 'Product 2', merchantId: 'user-2', weightKg: 2, lengthCm: 20, breadthCm: 20, heightCm: 20, packingType: 'fragile packing' },
+      { id: 'prod-1', name: 'Product 1', merchantId: 'user-2', weightKg: 1, lengthCm: 10, breadthCm: 10, heightCm: 10, transportationFee: 0, itemPackingFee: 0, warehousingRatePerKg: 0 },
+      { id: 'prod-2', name: 'Product 2', merchantId: 'user-2', weightKg: 2, lengthCm: 20, breadthCm: 20, heightCm: 20, transportationFee: 0, itemPackingFee: 0, warehousingRatePerKg: 0 },
     ];
     await Product.insertMany(products);
 

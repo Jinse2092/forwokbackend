@@ -10,7 +10,10 @@ const productSchema = new mongoose.Schema({
   lengthCm: Number,
   breadthCm: Number,
   heightCm: Number,
-  packingType: String,
+  // New fee fields: per-item transportation, per-item packing, and warehousing rate per kg
+  transportationFee: { type: Number, default: 0 },
+  itemPackingFee: { type: Number, default: 0 },
+  warehousingRatePerKg: { type: Number, default: 0 },
   price: { type: Number, default: 0 }, // Ensure price is always present
   cost: { type: Number, default: 0 }   // Ensure cost is always present
 });
