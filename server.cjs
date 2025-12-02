@@ -1296,10 +1296,20 @@ app.post('/api/forgot-password/request-otp', async (req, res) => {
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // OTP valid for 10 minutes
     otpStore[user.id] = { otp, expiresAt };
+
+    // Dev helper: optionally return OTP in response when testing locally
+    if (process.env.NODE_ENV !== 'production' && process.env.DEV_RETURN_OTP === 'true') {
+      console.log(`DEV_RETURN_OTP enabled. Returning OTP for userId=${user.id}`);
+      return res.json({ message: 'OTP sent (dev)', userId: user.id, otp });
+    }
+
     await sendOtpEmail(user.email, otp);
     res.json({ message: 'OTP sent to registered email', userId: user.id });
   } catch (err) {
     console.error('Error in request-otp:', err);
+    if (process.env.NODE_ENV !== 'production' || process.env.DEV_DEBUG === 'true') {
+      return res.status(500).json({ error: 'Internal Server Error', detail: err.message });
+    }
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
@@ -1314,10 +1324,19 @@ app.post('/api/register/request-otp', async (req, res) => {
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // OTP valid for 10 minutes
     otpStore[email] = { otp, expiresAt };
+    // Dev helper: optionally return OTP in response when testing locally
+    if (process.env.NODE_ENV !== 'production' && process.env.DEV_RETURN_OTP === 'true') {
+      console.log(`DEV_RETURN_OTP enabled. Returning OTP for email=${email}`);
+      return res.json({ message: 'OTP sent (dev)', email, otp });
+    }
+
     await sendOtpEmail(email, otp);
     res.json({ message: 'OTP sent to email', email });
   } catch (err) {
     console.error('Error in register request-otp:', err);
+    if (process.env.NODE_ENV !== 'production' || process.env.DEV_DEBUG === 'true') {
+      return res.status(500).json({ error: 'Internal Server Error', detail: err.message });
+    }
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
