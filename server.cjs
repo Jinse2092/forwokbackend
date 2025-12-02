@@ -4,6 +4,9 @@ require('dotenv').config();
 // Recommended: use environment variables or a secrets manager in production.
 process.env.GMAIL_USER = process.env.GMAIL_USER || 'forvoq@gmail.com';
 process.env.GMAIL_PASS = process.env.GMAIL_PASS || 'awgruswxpbrmvooz';
+// Admin upload secret (hardcoded by request).
+// WARNING: Hardcoding secrets is insecure. Do not commit this file to public repos.
+const ADMIN_UPLOAD_SECRET = '011225';
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -24,6 +27,16 @@ app.use(cors({
   credentials: true
 }));
 app.use(bodyParser.json());
+
+// Debug helper: log presence of admin header for admin routes (masked)
+app.use('/api/admin', (req, res, next) => {
+  try {
+    const provided = req.get('x-admin-upload-secret') || '';
+    const masked = provided ? (provided.length > 2 ? `${provided[0]}***${provided.slice(-1)}` : '***') : '<none>';
+    console.log(`/api/admin request - x-admin-upload-secret: ${masked} - ${req.method} ${req.path}`);
+  } catch (e) {}
+  next();
+});
 
 // MongoDB connection
 const mongoURI = 'mongodb+srv://LEO:leo112944@cluster0.ye9exkm.mongodb.net/forvoqdb?retryWrites=true&w=majority&appName=Cluster0';
@@ -145,8 +158,13 @@ app.post('/upload', upload.single('file'), (req, res) => {
 app.post('/api/admin/restore-zip', upload.single('file'), async (req, res) => {
   try {
     // simple auth: check secret header
-    const provided = req.get('x-admin-upload-secret');
-    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+    let provided = req.get('x-admin-upload-secret') || '';
+    provided = String(provided).trim();
+    const expected = String(ADMIN_UPLOAD_SECRET || '').trim();
+    if (!expected || !provided || provided !== expected) {
+      // Log masked values and lengths for debugging without revealing full secret
+      const mask = (s) => s ? (s.length > 2 ? `${s[0]}***${s.slice(-1)}` : '***') : '<none>';
+      console.log('/api/admin/restore-zip auth failed - provided:', mask(provided), `len=${provided.length}`, 'expected:', mask(expected), `len=${expected.length}`);
       return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
     }
 
@@ -437,8 +455,12 @@ app.post('/api/orders', async (req, res) => {
 app.post('/api/admin/backup-upload', async (req, res) => {
   try {
     // simple auth: check secret header
-    const provided = req.get('x-admin-upload-secret');
-    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+    let provided = req.get('x-admin-upload-secret') || '';
+    provided = String(provided).trim();
+    const expected = String(ADMIN_UPLOAD_SECRET || '').trim();
+    if (!expected || !provided || provided !== expected) {
+      const mask = (s) => s ? (s.length > 2 ? `${s[0]}***${s.slice(-1)}` : '***') : '<none>';
+      console.log('/api/admin/backup-upload auth failed - provided:', mask(provided), `len=${provided.length}`, 'expected:', mask(expected), `len=${expected.length}`);
       return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
     }
 
@@ -494,8 +516,12 @@ app.post('/api/admin/backup-upload', async (req, res) => {
 // Admin export endpoint: returns all main collections as a single JSON object
 app.get('/api/admin/export-all', async (req, res) => {
   try {
-    const provided = req.get('x-admin-upload-secret');
-    if (!process.env.ADMIN_UPLOAD_SECRET || !provided || provided !== process.env.ADMIN_UPLOAD_SECRET) {
+    let provided = req.get('x-admin-upload-secret') || '';
+    provided = String(provided).trim();
+    const expected = String(ADMIN_UPLOAD_SECRET || '').trim();
+    if (!expected || !provided || provided !== expected) {
+      const mask = (s) => s ? (s.length > 2 ? `${s[0]}***${s.slice(-1)}` : '***') : '<none>';
+      console.log('/api/admin/export-all auth failed - provided:', mask(provided), `len=${provided.length}`, 'expected:', mask(expected), `len=${expected.length}`);
       return res.status(403).json({ error: 'Forbidden: invalid admin upload secret' });
     }
 
