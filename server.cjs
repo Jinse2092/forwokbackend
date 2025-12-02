@@ -733,7 +733,7 @@ app.put('/api/orders/:id', async (req, res) => {
 
           const boxFee = Number((updatedData.boxFee !== undefined ? updatedData.boxFee : savedOrder.boxFee) || 0);
           const boxCutting = Boolean((updatedData.boxCutting !== undefined ? updatedData.boxCutting : savedOrder.boxCutting) || false);
-          const boxCuttingCharge = boxCutting ? 2 : 0;
+          const boxCuttingCharge = boxCutting ? 1 : 0;
           const trackingFee = Number((updatedData.trackingFee !== undefined ? updatedData.trackingFee : (savedOrder.trackingFee !== undefined ? savedOrder.trackingFee : 3)) || 3);
           const totalPackingFee = Number((itemsPackingTotal + boxFee + boxCuttingCharge + trackingFee).toFixed(2));
 
@@ -807,6 +807,8 @@ const inventorySchema = new mongoose.Schema({
   id: String,
   productId: String,
   merchantId: String,
+  dispatchedQuantity: { type: Number, default: 0 },
+  packedQuantity: { type: Number, default: 0 },
   quantity: Number,
   location: String,
   minStockLevel: Number,
@@ -1056,7 +1058,8 @@ app.patch('/api/inventory/:id', async (req, res) => {
 });
 
 // Create inventory item with specific id if not exists
-app.post('/api/inventory/:id', async (req, res) => {
+// NOTE: route renamed to avoid collision with other literal paths (e.g. 'dispatched-aggregate')
+app.post('/api/inventory/create/:id', async (req, res) => {
   const id = req.params.id;
   const data = req.body;
   try {
@@ -1070,6 +1073,43 @@ app.post('/api/inventory/:id', async (req, res) => {
   } catch (err) {
     console.error('Error creating inventory item:', err);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// POST endpoint to accept aggregated dispatched quantities for multiple merchant/product pairs.
+// Body: [{ merchantId, productId, dispatched }] — sets `dispatchedQuantity` on inventory documents.
+app.post('/api/inventory/dispatched-aggregate', async (req, res) => {
+  try {
+    const list = req.body;
+    if (!Array.isArray(list)) {
+      return res.status(400).json({ error: 'Expected an array of { merchantId, productId, dispatched }' });
+    }
+    const results = [];
+    for (const entry of list) {
+      const merchantId = entry.merchantId;
+      const productId = entry.productId;
+      const dispatched = Number(entry.dispatched || 0);
+      if (!merchantId || !productId) continue;
+
+      // Use upsert to create or update a document safely (avoid duplicate-create conflicts)
+      const updateDoc = {
+        $set: {
+          productId,
+          merchantId,
+          dispatchedQuantity: dispatched,
+          location: 'Default Warehouse',
+          minStockLevel: 0,
+          maxStockLevel: 0,
+        }
+      };
+      const options = { upsert: true, new: true, setDefaultsOnInsert: true };
+      const upserted = await Inventory.findOneAndUpdate({ merchantId, productId }, updateDoc, options);
+      results.push({ merchantId, productId, id: upserted.id, dispatchedQuantity: upserted.dispatchedQuantity });
+    }
+    return res.json({ ok: true, results });
+  } catch (err) {
+    console.error('Error storing dispatched aggregate', err);
+    return res.status(500).json({ error: 'Failed to store dispatched aggregate' });
   }
 });
 
@@ -1534,6 +1574,50 @@ app.post('/api/inventory/:id/decrement', async (req, res) => {
   } catch (err) {
     console.error('Error decrementing inventory:', err);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// POST endpoint to accept aggregated dispatched quantities for multiple merchant/product pairs.
+// Body: [{ merchantId, productId, dispatched }] — sets `dispatchedQuantity` on inventory documents.
+app.post('/api/inventory/dispatched-aggregate', async (req, res) => {
+  try {
+    const list = req.body;
+    if (!Array.isArray(list)) {
+      return res.status(400).json({ error: 'Expected an array of { merchantId, productId, dispatched }' });
+    }
+    const results = [];
+    for (const entry of list) {
+      const merchantId = entry.merchantId;
+      const productId = entry.productId;
+      const dispatched = Number(entry.dispatched || 0);
+      if (!merchantId || !productId) continue;
+
+      let inv = await Inventory.findOne({ merchantId: merchantId, productId: productId });
+      if (inv) {
+        inv.dispatchedQuantity = dispatched;
+        await inv.save();
+        results.push({ merchantId, productId, id: inv.id, dispatchedQuantity: inv.dispatchedQuantity });
+      } else {
+        // Use upsert to create or update a document safely (avoid duplicate-create conflicts)
+        const updateDoc = {
+          $set: {
+            productId,
+            merchantId,
+            dispatchedQuantity: dispatched,
+            location: 'Default Warehouse',
+            minStockLevel: 0,
+            maxStockLevel: 0,
+          }
+        };
+        const options = { upsert: true, new: true, setDefaultsOnInsert: true };
+        const upserted = await Inventory.findOneAndUpdate({ merchantId, productId }, updateDoc, options);
+        results.push({ merchantId, productId, id: upserted.id, dispatchedQuantity: upserted.dispatchedQuantity });
+      }
+    }
+    return res.json({ ok: true, results });
+  } catch (err) {
+    console.error('Error storing dispatched aggregate', err);
+    return res.status(500).json({ error: 'Failed to store dispatched aggregate' });
   }
 });
 

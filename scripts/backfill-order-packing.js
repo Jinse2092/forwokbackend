@@ -92,7 +92,7 @@ async function main(orderIdOrInternalId) {
     const existingBoxFee = (order.boxFee !== undefined && order.boxFee !== null) ? Number(order.boxFee) : 0;
     const existingBoxCutting = !!order.boxCutting;
     const trackingFee = (order.trackingFee !== undefined && order.trackingFee !== null) ? Number(order.trackingFee) : 3;
-    const boxCuttingCharge = existingBoxCutting ? 2 : 0;
+    const boxCuttingCharge = existingBoxCutting ? 1 : 0;
 
     const totalPackingFee = Number((itemsPackingTotal + existingBoxFee + boxCuttingCharge + trackingFee).toFixed(2));
 
