@@ -682,16 +682,55 @@ app.put('/api/orders/:id', async (req, res) => {
       existingOrder.packingDetails = updatedData.packingDetails;
     }
 
+    // Defensive normalization: coerce numeric fields on items and compute
+    // total weights from per-item weights when the client didn't provide them.
+    try {
+      // Ensure items array exists on the order
+      existingOrder.items = Array.isArray(existingOrder.items) ? existingOrder.items : (updatedData.items || []);
+
+      // Coerce per-item numeric fields and compute total weight from items
+      let totalFromItems = 0;
+      for (let it of existingOrder.items) {
+        if (!it) continue;
+        if (it.quantity !== undefined) it.quantity = Number(it.quantity) || 0;
+        if (it.weightPerItemKg !== undefined) it.weightPerItemKg = Number(it.weightPerItemKg) || 0;
+        if (it.weightKg !== undefined) it.weightKg = Number(it.weightKg) || 0;
+
+        const perItem = (it.weightPerItemKg !== undefined && it.weightPerItemKg !== null && !Number.isNaN(it.weightPerItemKg))
+          ? it.weightPerItemKg
+          : ((it.weightKg !== undefined && it.weightKg !== null && !Number.isNaN(it.weightKg)) ? it.weightKg : 0);
+
+        totalFromItems += (Number(it.quantity) || 0) * (Number(perItem) || 0);
+      }
+
+      // Use client-provided totalWeightKg if present, otherwise computed value
+      if (updatedData.totalWeightKg !== undefined) {
+        existingOrder.totalWeightKg = Number(updatedData.totalWeightKg) || 0;
+      } else {
+        existingOrder.totalWeightKg = totalFromItems;
+      }
+
+      // Use client-provided packedweight if present, otherwise computed value
+      if (updatedData.packedweight !== undefined) {
+        existingOrder.packedweight = Number(updatedData.packedweight) || 0;
+      } else {
+        existingOrder.packedweight = totalFromItems;
+      }
+    } catch (normErr) {
+      console.warn(`PUT /api/orders/${id} - normalization error:`, normErr && (normErr.stack || normErr.message));
+    }
+
     console.log(`PUT /api/orders/${id} - Fields after applying updates:`, JSON.stringify({
       trackingCode: existingOrder.trackingCode,
       totalWeightKg: existingOrder.totalWeightKg,
       packedAt: existingOrder.packedAt,
-      status: existingOrder.status
+      status: existingOrder.status,
+      packedweight: existingOrder.packedweight
     }, null, 2));
 
     // Save the updated order
     const savedOrder = await existingOrder.save();
-    console.log(`PUT /api/orders/${id} - Updated order saved:`, JSON.stringify(savedOrder.toObject(), null, 2));
+    console.log(`PUT /api/orders/${id} - Updated order saved (initial save):`, JSON.stringify(savedOrder.toObject(), null, 2));
 
     // Server-authoritative: when order is packed, compute per-item components and upsert PackingFee
     try {
@@ -763,6 +802,58 @@ app.put('/api/orders/:id', async (req, res) => {
           const trackingFee = Number((updatedData.trackingFee !== undefined ? updatedData.trackingFee : (savedOrder.trackingFee !== undefined ? savedOrder.trackingFee : 3)) || 3);
           const totalPackingFee = Number((itemsPackingTotal + boxFee + boxCuttingCharge + trackingFee).toFixed(2));
 
+        // Recompute authoritative total weight from savedOrder.items to ensure
+        // server-side totalWeightKg / packedweight reflect per-item weights
+        let computedTotalWeight = 0;
+        try {
+          const sItems = Array.isArray(savedOrder.items) ? savedOrder.items : [];
+          for (const iti of sItems) {
+            if (!iti) continue;
+            const qtyi = Number(iti.quantity || 0) || 0;
+            const perItemWeight = (iti.weightPerItemKg !== undefined && iti.weightPerItemKg !== null && !Number.isNaN(iti.weightPerItemKg))
+              ? Number(iti.weightPerItemKg)
+              : ((iti.weightKg !== undefined && iti.weightKg !== null && !Number.isNaN(iti.weightKg)) ? Number(iti.weightKg) : 0);
+            computedTotalWeight += qtyi * (perItemWeight || 0);
+          }
+        } catch (wErr) {
+          console.warn('Error recomputing total weight from items for order', id, wErr && (wErr.stack || wErr.message));
+        }
+
+        // Persist authoritative total weight fields onto the savedOrder object
+        try {
+          savedOrder.totalWeightKg = Number(computedTotalWeight) || 0;
+          savedOrder.packedweight = Number(computedTotalWeight) || 0;
+        } catch (setErr) {
+          console.warn('Error setting totalWeightKg/packedweight on savedOrder', id, setErr && (setErr.stack || setErr.message));
+        }
+
+        // Force-write these fields to the DB immediately to avoid any
+        // inconsistencies due to document state / later saves.
+        try {
+          console.log(`PUT /api/orders/${id} - computedTotalWeight:`, Number(computedTotalWeight) || 0);
+          const forced = await Order.findOneAndUpdate(
+            { id },
+            { $set: { totalWeightKg: Number(computedTotalWeight) || 0, packedweight: Number(computedTotalWeight) || 0 } },
+            { new: true }
+          );
+          console.log(`PUT /api/orders/${id} - force-update result:`, forced ? JSON.stringify({ id: forced.id, totalWeightKg: forced.totalWeightKg, packedweight: forced.packedweight }, null, 2) : '<no doc>');
+          if (forced) {
+            // Replace savedOrder with DB authoritative document so subsequent
+            // modifications operate on the latest state.
+            savedOrder = forced;
+          } else {
+            // If findOneAndUpdate returned null for some reason, re-load the doc
+            try { savedOrder = await Order.findOne({ id }); } catch (reErr) { /* swallow */ }
+          }
+          // Ensure the in-memory savedOrder has the computed weights as numbers
+          if (savedOrder) {
+            savedOrder.totalWeightKg = Number(savedOrder.totalWeightKg) || Number(computedTotalWeight) || 0;
+            savedOrder.packedweight = Number(savedOrder.packedweight) || Number(computedTotalWeight) || 0;
+          }
+        } catch (forceErr) {
+          console.warn('Error force-updating order totalWeightKg/packedweight for', id, forceErr && (forceErr.stack || forceErr.message));
+        }
+
         const pfDoc = {
           orderId: id,
           merchantId: savedOrder.merchantId,
@@ -795,7 +886,15 @@ app.put('/api/orders/:id', async (req, res) => {
     } catch (pfErr) {
       console.error('Error computing/upserting PackingFee doc for order', id, pfErr);
     }
-    res.json(savedOrder);
+    // Return an authoritative fresh copy from DB so client receives exactly what's persisted
+    try {
+      const fresh = await Order.findOne({ id });
+      console.log(`PUT /api/orders/${id} - final authoritative DB copy:`, JSON.stringify(fresh ? fresh.toObject() : null, null, 2));
+      return res.json(fresh || savedOrder);
+    } catch (e) {
+      console.warn('PUT /api/orders/:id - failed to fetch fresh order after save', e);
+      return res.json(savedOrder);
+    }
   } catch (err) {
     console.error('Error updating order:', err);
     res.status(500).json({ error: 'Internal Server Error', details: err.message });
