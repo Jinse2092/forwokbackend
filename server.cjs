@@ -638,6 +638,7 @@ app.put('/api/orders/:id', async (req, res) => {
     if (updatedData.state !== undefined) existingOrder.state = updatedData.state;
     if (updatedData.pincode !== undefined) existingOrder.pincode = updatedData.pincode;
     if (updatedData.phone !== undefined) existingOrder.phone = updatedData.phone;
+    if (updatedData.deliveryPartner !== undefined) existingOrder.deliveryPartner = updatedData.deliveryPartner;
     if (updatedData.status !== undefined) existingOrder.status = updatedData.status;
     if (updatedData.items !== undefined) existingOrder.items = updatedData.items;
     // Persist total weight and packed timestamp if provided (allow zero values)
@@ -729,7 +730,7 @@ app.put('/api/orders/:id', async (req, res) => {
     }, null, 2));
 
     // Save the updated order
-    const savedOrder = await existingOrder.save();
+    let savedOrder = await existingOrder.save();
     console.log(`PUT /api/orders/${id} - Updated order saved (initial save):`, JSON.stringify(savedOrder.toObject(), null, 2));
 
     // Server-authoritative: when order is packed, compute per-item components and upsert PackingFee
@@ -819,10 +820,15 @@ app.put('/api/orders/:id', async (req, res) => {
           console.warn('Error recomputing total weight from items for order', id, wErr && (wErr.stack || wErr.message));
         }
 
+        // Decide final authoritative weight. If client provided `packedweight`, prefer that
+        // (the admin-entered value). Otherwise, use computedTotalWeight from per-item weights.
+        const clientPacked = (updatedData && Object.prototype.hasOwnProperty.call(updatedData, 'packedweight')) ? Number(updatedData.packedweight || 0) : undefined;
+        const finalWeight = (clientPacked !== undefined && !Number.isNaN(clientPacked)) ? clientPacked : Number(computedTotalWeight) || 0;
+
         // Persist authoritative total weight fields onto the savedOrder object
         try {
-          savedOrder.totalWeightKg = Number(computedTotalWeight) || 0;
-          savedOrder.packedweight = Number(computedTotalWeight) || 0;
+          savedOrder.totalWeightKg = finalWeight;
+          savedOrder.packedweight = finalWeight;
         } catch (setErr) {
           console.warn('Error setting totalWeightKg/packedweight on savedOrder', id, setErr && (setErr.stack || setErr.message));
         }
@@ -830,10 +836,10 @@ app.put('/api/orders/:id', async (req, res) => {
         // Force-write these fields to the DB immediately to avoid any
         // inconsistencies due to document state / later saves.
         try {
-          console.log(`PUT /api/orders/${id} - computedTotalWeight:`, Number(computedTotalWeight) || 0);
+          console.log(`PUT /api/orders/${id} - computedTotalWeight:`, Number(computedTotalWeight) || 0, ' clientPacked:', clientPacked);
           const forced = await Order.findOneAndUpdate(
             { id },
-            { $set: { totalWeightKg: Number(computedTotalWeight) || 0, packedweight: Number(computedTotalWeight) || 0 } },
+            { $set: { totalWeightKg: finalWeight, packedweight: finalWeight } },
             { new: true }
           );
           console.log(`PUT /api/orders/${id} - force-update result:`, forced ? JSON.stringify({ id: forced.id, totalWeightKg: forced.totalWeightKg, packedweight: forced.packedweight }, null, 2) : '<no doc>');
@@ -847,8 +853,8 @@ app.put('/api/orders/:id', async (req, res) => {
           }
           // Ensure the in-memory savedOrder has the computed weights as numbers
           if (savedOrder) {
-            savedOrder.totalWeightKg = Number(savedOrder.totalWeightKg) || Number(computedTotalWeight) || 0;
-            savedOrder.packedweight = Number(savedOrder.packedweight) || Number(computedTotalWeight) || 0;
+            savedOrder.totalWeightKg = Number(savedOrder.totalWeightKg) || finalWeight || 0;
+            savedOrder.packedweight = Number(savedOrder.packedweight) || finalWeight || 0;
           }
         } catch (forceErr) {
           console.warn('Error force-updating order totalWeightKg/packedweight for', id, forceErr && (forceErr.stack || forceErr.message));
