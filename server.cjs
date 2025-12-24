@@ -95,6 +95,8 @@ const orderSchema = new mongoose.Schema({
   deliveredAt: { type: String, default: '' },
   // Courier/delivery partner name provided at creation or edit
   deliveryPartner: { type: String, default: '' },
+  // Source of the order creation (e.g., 'manual' when merchant uses Add Order form)
+  source: { type: String, default: null },
   shippingLabelBase64: String, // Store base64 encoded PDF
 }, { strict: false }); // Allow extra fields in case of backwards compatibility
 
@@ -425,6 +427,8 @@ app.post('/api/orders', async (req, res) => {
       deliveryPartner: orderData.deliveryPartner || '',
       shippingLabelBase64: orderData.shippingLabelBase64 || '',
         trackingCode: orderData.trackingCode !== undefined ? orderData.trackingCode : '',
+      // Record source if provided (e.g., 'manual' for merchant manual entry)
+      source: orderData.source !== undefined ? orderData.source : null,
       // Accept packedweight if provided (allows storing frontend-entered packed weight)
       packedweight: orderData.packedweight !== undefined ? orderData.packedweight : (orderData.totalWeightKg || ''),
     };
@@ -438,6 +442,19 @@ app.post('/api/orders', async (req, res) => {
     // Verify the saved document includes all fields
     const verifyOrder = await Order.findOne({ id: orderData.id });
     console.log('POST /api/orders - Verification from DB:', JSON.stringify(verifyOrder.toObject(), null, 2));
+    // Defensive: if client provided a source but it wasn't persisted for some reason,
+    // explicitly set it and fetch the authoritative copy again.
+    if ((verifyOrder.source === undefined || verifyOrder.source === null) && orderData.source !== undefined) {
+      try {
+        console.log('POST /api/orders - Source missing in DB, forcing source:', orderData.source);
+        const forced = await Order.findOneAndUpdate({ id: orderData.id }, { $set: { source: orderData.source } }, { new: true });
+        if (forced) {
+          console.log('POST /api/orders - Forced source persisted, updated doc:', JSON.stringify(forced.toObject(), null, 2));
+        }
+      } catch (e) {
+        console.error('POST /api/orders - Failed to force-persist source:', e);
+      }
+    }
     
     res.status(201).json(verifyOrder);
   } catch (err) {
@@ -639,6 +656,7 @@ app.put('/api/orders/:id', async (req, res) => {
     if (updatedData.pincode !== undefined) existingOrder.pincode = updatedData.pincode;
     if (updatedData.phone !== undefined) existingOrder.phone = updatedData.phone;
     if (updatedData.deliveryPartner !== undefined) existingOrder.deliveryPartner = updatedData.deliveryPartner;
+    if (updatedData.source !== undefined) existingOrder.source = updatedData.source;
     if (updatedData.status !== undefined) existingOrder.status = updatedData.status;
     if (updatedData.items !== undefined) existingOrder.items = updatedData.items;
     // Persist total weight and packed timestamp if provided (allow zero values)
