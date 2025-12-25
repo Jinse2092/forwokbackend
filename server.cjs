@@ -1087,6 +1087,10 @@ app.post('/api/products', async (req, res) => {
     // Sanitize and normalize numeric fields to ensure schema consistency
     const sanitized = {
       ...productData,
+      // Normalize `skus` to an array of strings when provided by frontend
+      skus: Array.isArray(productData.skus) ? productData.skus.map(s => String(s)) : (productData.skus ? [String(productData.skus)] : []),
+      // Ensure we persist a single `sku` (backwards-compatibility) using first element from `skus` when available
+      sku: (Array.isArray(productData.skus) && productData.skus.length > 0) ? String(productData.skus[0]) : (productData.sku || ''),
       price: productData.price === undefined || productData.price === null ? 0 : Number(productData.price),
       cost: productData.cost === undefined || productData.cost === null ? 0 : Number(productData.cost),
       weightKg: productData.weightKg === undefined || productData.weightKg === null ? 0 : Number(productData.weightKg),
@@ -1118,6 +1122,15 @@ app.put('/api/products/:id', async (req, res) => {
       ...(updatedData.itemPackingFee !== undefined && { itemPackingFee: Number(updatedData.itemPackingFee) }),
       ...(updatedData.warehousingRatePerKg !== undefined && { warehousingRatePerKg: Number(updatedData.warehousingRatePerKg) }),
     };
+    // If client provided `skus`, normalize and persist the array and also keep `sku` fallback
+    if (updatedData.skus !== undefined) {
+      updatePayload.skus = Array.isArray(updatedData.skus) ? updatedData.skus.map(s => String(s)) : [String(updatedData.skus || '')];
+      if (Array.isArray(updatePayload.skus) && updatePayload.skus.length > 0) {
+        updatePayload.sku = String(updatePayload.skus[0] || '');
+      }
+    } else if (updatedData.sku !== undefined) {
+      updatePayload.sku = String(updatedData.sku || '');
+    }
 
     const updatedProduct = await Product.findOneAndUpdate({ id }, updatePayload, { new: true });
     if (!updatedProduct) return res.status(404).json({ error: 'Product not found' });

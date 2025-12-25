@@ -4,6 +4,7 @@ const productSchema = new mongoose.Schema({
   id: String,
   name: String,
   sku: { type: String, default: '' }, // Ensure sku is always present
+  skus: { type: [String], default: [] },
   category: { type: String, default: '' }, // Ensure category is always present
   merchantId: String,
   weightKg: Number,
