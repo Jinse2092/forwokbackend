@@ -14,6 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const mongoose = require('mongoose');
 const multer = require('multer');
+const crypto = require("crypto");
 
 const app = express();
 const PORT = 4000;
@@ -26,7 +27,17 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization', 'x-admin-upload-secret'],
   credentials: true
 }));
-app.use(bodyParser.json());
+// Capture raw request body for webhook HMAC verification while keeping
+// JSON parsing for normal routes.
+app.use(bodyParser.json({
+  verify: function (req, res, buf) {
+    try {
+      req.rawBody = buf;
+    } catch (e) {
+      req.rawBody = null;
+    }
+  }
+}));
 
 // Debug helper: log presence of admin header for admin routes (masked)
 app.use('/api/admin', (req, res, next) => {
@@ -65,6 +76,21 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 
+// Webhook schema and model
+const webhookSchema = new mongoose.Schema({
+  id: { type: String, required: true, unique: true },
+  merchantId: String,
+  topic: String,
+  address: String,
+  format: { type: String, default: 'json' },
+  shopifyDomain: String,
+  signature: String,
+  active: { type: Boolean, default: true },
+  createdAt: { type: String, default: () => new Date().toISOString() }
+}, { strict: false });
+
+const Webhook = mongoose.model('Webhook', webhookSchema);
+
 const axios = require('axios');
 
 // Order schema and model
@@ -99,6 +125,12 @@ const orderSchema = new mongoose.Schema({
   source: { type: String, default: null },
   shippingLabelBase64: String, // Store base64 encoded PDF
 }, { strict: false }); // Allow extra fields in case of backwards compatibility
+
+// Index to prevent duplicate Shopify webhook processing (sparse + unique)
+orderSchema.index(
+  { shopifyWebhookId: 1 },
+  { unique: true, sparse: true }
+);
 
 const Order = mongoose.model('Order', orderSchema);
 
@@ -315,6 +347,154 @@ app.get('/api/users/:id', async (req, res) => {
   } catch (err) {
     console.error('Error fetching user by id:', err);
     res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// --- Webhook endpoints ---
+
+// Get all webhooks (admin)
+app.get('/api/webhooks', async (req, res) => {
+  try {
+    console.log('GET /api/webhooks called');
+    const list = await Webhook.find().sort({ createdAt: -1 });
+    return res.json(list);
+  } catch (err) {
+    console.error('Error fetching webhooks:', err && (err.stack || err));
+    // Return empty list on error so frontend table can render gracefully.
+    return res.json([]);
+  }
+});
+
+// Get webhooks for a merchant
+app.get('/api/merchants/:id/webhooks', async (req, res) => {
+  try {
+    const id = req.params.id;
+    console.log(`/api/merchants/${id}/webhooks called - returning all webhooks`);
+    // Return all webhooks so the admin UI always shows full data set.
+    const list = await Webhook.find().sort({ createdAt: -1 });
+    return res.json(list);
+  } catch (err) {
+    console.error('Error fetching merchant webhooks:', err && (err.stack || err));
+    // Return empty list on error so frontend shows no webhooks instead of failing.
+    return res.json([]);
+  }
+});
+
+// Create webhook for merchant
+app.post('/api/merchants/:id/webhooks', async (req, res) => {
+  try {
+    const mId = req.params.id;
+    const body = req.body || {};
+    console.log('/api/merchants/:id/webhooks - payload:', JSON.stringify(body));
+    const newWh = new Webhook({
+      id: `wh-${Date.now()}`,
+      merchantId: mId,
+      topic: body.topic || 'orders/create',
+      address: body.address || '',
+      format: body.format || 'json',
+      shopifyDomain: body.shopifyDomain || '',
+      signature: body.signature || '',
+      active: body.active !== undefined ? body.active : true,
+      createdAt: new Date().toISOString()
+    });
+    try {
+      const saved = await newWh.save();
+      console.log('Webhook saved:', saved.id || saved._id);
+      return res.status(201).json(saved);
+    } catch (saveErr) {
+      console.error('Error saving webhook to DB:', saveErr && (saveErr.stack || saveErr.message));
+      return res.status(500).json({ error: 'Failed to save webhook', details: saveErr && saveErr.message });
+    }
+  } catch (err) {
+    console.error('Error creating webhook:', err);
+    return res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+// Create global webhook (no merchant)
+app.post('/api/webhooks', async (req, res) => {
+  try {
+    const body = req.body || {};
+    console.log('/api/webhooks - payload:', JSON.stringify(body));
+    const newWh = new Webhook({
+      id: `wh-${Date.now()}`,
+      merchantId: body.merchantId || '',
+      topic: body.topic || 'orders/create',
+      address: body.address || '',
+      format: body.format || 'json',
+      shopifyDomain: body.shopifyDomain || '',
+      signature: body.signature || '',
+      active: body.active !== undefined ? body.active : true,
+      createdAt: new Date().toISOString()
+    });
+    try {
+      const saved = await newWh.save();
+      console.log('Global webhook saved:', saved.id || saved._id);
+      return res.status(201).json(saved);
+    } catch (saveErr) {
+      console.error('Error saving global webhook to DB:', saveErr && (saveErr.stack || saveErr.message));
+      return res.status(500).json({ error: 'Failed to save webhook', details: saveErr && saveErr.message });
+    }
+  } catch (err) {
+    console.error('Error creating webhook:', err);
+    return res.status(500).json({ error: 'Internal Server Error', details: err.message });
+  }
+});
+
+// Delete a merchant webhook
+app.delete('/api/merchants/:id/webhooks/:wid', async (req, res) => {
+  try {
+    const { id, wid } = req.params;
+    const deleted = await Webhook.findOneAndDelete({ id: wid, merchantId: id });
+    if (!deleted) return res.status(404).json({ error: 'Webhook not found' });
+    return res.json({ message: 'Webhook deleted' });
+  } catch (err) {
+    console.error('Error deleting merchant webhook:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Delete global webhook by id
+app.delete('/api/webhooks/:id', async (req, res) => {
+  try {
+    const wid = req.params.id;
+    const deleted = await Webhook.findOneAndDelete({ id: wid });
+    if (!deleted) return res.status(404).json({ error: 'Webhook not found' });
+    return res.json({ message: 'Webhook deleted' });
+  } catch (err) {
+    console.error('Error deleting webhook:', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Update global webhook by id
+app.patch('/api/webhooks/:id', async (req, res) => {
+  try {
+    const wid = req.params.id;
+    const update = req.body || {};
+    // Prevent changing the primary generated id
+    delete update.id;
+    const updated = await Webhook.findOneAndUpdate({ id: wid }, { $set: update }, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Webhook not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('Error updating webhook:', err && (err.stack || err));
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
+// Update merchant-scoped webhook
+app.patch('/api/merchants/:id/webhooks/:wid', async (req, res) => {
+  try {
+    const { id, wid } = req.params;
+    const update = req.body || {};
+    delete update.id;
+    const updated = await Webhook.findOneAndUpdate({ id: wid, merchantId: id }, { $set: update }, { new: true });
+    if (!updated) return res.status(404).json({ error: 'Webhook not found' });
+    return res.json(updated);
+  } catch (err) {
+    console.error('Error updating merchant webhook:', err && (err.stack || err));
+    return res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
@@ -1436,7 +1616,6 @@ app.delete('/api/savedPickupLocations/:id', async (req, res) => {
 });
 
 const bcrypt = require('bcrypt');
-const crypto = require('crypto');
 const nodemailer = require('nodemailer');
 
 // In-memory OTP store: { userIdentifier: { otp: string, expiresAt: Date } }
@@ -1872,6 +2051,162 @@ app.get('/api/packingfees', async (req, res) => {
   }
 });
 
+
+// Start server (PUBLIC)
+// Shopify HMAC verifier
+function verifyShopifyHmac(rawBody, hmacHeader, secret) {
+  try {
+    const generated = crypto.createHmac('sha256', secret).update(rawBody).digest();
+    const headerBuf = Buffer.from(String(hmacHeader || ''), 'base64');
+    if (!headerBuf || headerBuf.length !== generated.length) return false;
+    return crypto.timingSafeEqual(generated, headerBuf);
+  } catch (e) {
+    return false;
+  }
+}
+
+// Shopify webhook route
+app.post(
+  "/internal/shopify/webhook",
+  async (req, res) => {
+    try {
+      const shopDomain = req.headers["x-shopify-shop-domain"];
+      const hmacHeader = req.headers["x-shopify-hmac-sha256"];
+      const webhookId = req.headers["x-shopify-webhook-id"];
+
+      if (!shopDomain || !hmacHeader || !webhookId) {
+        return res.status(400).send("Missing Shopify headers");
+      }
+
+      // 🔁 Duplicate webhook protection
+      const existing = await Order.findOne({
+        shopifyWebhookId: webhookId
+      });
+
+      if (existing) {
+        return res.status(200).send("Duplicate webhook ignored");
+      }
+
+      // 🔍 Find active webhook config
+      const webhook = await Webhook.findOne({
+        shopifyDomain: shopDomain,
+        topic: "orders/create",
+        active: true
+      });
+
+      if (!webhook) {
+        return res.status(401).send("Webhook not registered");
+      }
+
+      // 🔐 Verify signature using captured raw body
+      const raw = req.rawBody || (req.body && Buffer.from(JSON.stringify(req.body))) || Buffer.alloc(0);
+      const isValid = verifyShopifyHmac(raw, hmacHeader, webhook.signature);
+
+      if (!isValid) {
+        return res.status(401).send("Invalid Shopify signature");
+      }
+
+      const payload = JSON.parse((req.rawBody || Buffer.from(JSON.stringify(req.body))).toString());
+
+      await createShopifyOrder(
+        payload,
+        webhook.merchantId,
+        webhookId
+      );
+
+      res.status(200).send("OK");
+    } catch (err) {
+      console.error("Shopify webhook error:", err);
+      res.status(500).send("Server error");
+    }
+  }
+);
+
+// Create order from Shopify payload
+async function createShopifyOrder(payload, merchantId, webhookId) {
+  if (payload.financial_status !== "paid") return;
+
+  const orderItems = [];
+
+  for (const item of payload.line_items) {
+    if (!item.sku) continue;
+
+    const sku = item.sku.trim().toLowerCase();
+
+    const product = await Product.findOne({
+      merchantId: merchantId,
+      $or: [
+        { sku: { $regex: `^${sku}$`, $options: "i" } },
+        { skus: { $elemMatch: { $regex: `^${sku}$`, $options: "i" } } }
+      ]
+    });
+
+    if (!product) continue;
+
+    const warehousingFee =
+      product.warehousingRatePerKg *
+      product.weightKg *
+      item.quantity;
+
+    const packingFee =
+      product.itemPackingFee *
+      item.quantity;
+
+    const transportationFee =
+      product.transportationFee *
+      item.quantity;
+
+    const estimatedTotal =
+      warehousingFee +
+      packingFee +
+      transportationFee;
+
+    orderItems.push({
+      productId: product.id,
+      name: product.name,
+      sku: item.sku,
+      quantity: item.quantity,
+
+      weightKg: product.weightKg,
+
+      warehousingPerItem: warehousingFee,
+      transportationPerItem: transportationFee,
+      itemPackingPerItem: packingFee,
+      estimatedTotalPerItem: estimatedTotal,
+      lineTotal: estimatedTotal
+    });
+  }
+
+  if (!orderItems.length) return;
+
+  const order = new Order({
+    id: `ord-${Date.now()}`,
+    merchantId: merchantId,
+
+    customerName: payload.shipping_address?.name,
+    address: payload.shipping_address?.address1,
+    city: payload.shipping_address?.city,
+    state: payload.shipping_address?.province,
+    pincode: payload.shipping_address?.zip,
+    phone: payload.shipping_address?.phone,
+
+    items: orderItems,
+    source: "shopify",
+    status: "pending",
+
+    shopifyWebhookId: webhookId,
+
+    packedweight: orderItems.reduce(
+      (sum, i) => sum + i.weightKg * i.quantity,
+      0
+    ),
+
+    date: new Date().toISOString().slice(0, 10),
+    time: new Date().toLocaleTimeString()
+  });
+
+  await order.save();
+}
 
 // Start server (PUBLIC)
 app.listen(PORT, '0.0.0.0', () => {
