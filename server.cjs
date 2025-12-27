@@ -7,6 +7,9 @@ process.env.GMAIL_PASS = process.env.GMAIL_PASS || 'awgruswxpbrmvooz';
 // Admin upload secret (hardcoded by request).
 // WARNING: Hardcoding secrets is insecure. Do not commit this file to public repos.
 const ADMIN_UPLOAD_SECRET = '011225';
+// Service API token used by internal services (e.g. shopify-listener) to
+// authenticate when creating orders. Prefer setting in environment (production).
+process.env.SERVICE_API_TOKEN = process.env.SERVICE_API_TOKEN || 'listener@2025';
 const express = require('express');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -571,7 +574,20 @@ async function fetchISTDateTime() {
 }
 
 app.post('/api/orders', async (req, res) => {
-  const orderData = req.body;
+  const orderData = req.body || {};
+  // If a service token is provided, validate it and mark request as service-origin.
+  const providedSvc = (req.get && (req.get('x-service-api-token') || req.query && req.query.serviceApiToken)) || (req.body && req.body.serviceApiToken);
+  if (providedSvc) {
+    const raw = String(req.get('x-service-api-token') || req.query && req.query.serviceApiToken || (req.body && req.body.serviceApiToken) || '');
+    const masked = raw ? (raw.length > 4 ? `${raw.slice(0,2)}***${raw.slice(-2)}` : '***') : '<none>';
+    console.log('POST /api/orders - service token provided (masked):', masked);
+    if (!isValidServiceToken(req)) {
+      console.log('POST /api/orders - invalid service token');
+      return res.status(403).json({ error: 'Forbidden: invalid service API token' });
+    }
+    orderData.source = orderData.source || 'service';
+    req.isService = true;
+  }
   console.log('POST /api/orders - Received order data:', JSON.stringify(orderData, null, 2));
   if (!orderData.id) {
     return res.status(400).json({ error: 'Order id is required' });
@@ -1802,6 +1818,16 @@ function authenticateToken(req, res, next) {
     req.user = decoded;
     next();
   });
+}
+
+// Validate a lightweight service API token sent by trusted internal services
+// The header used is `x-service-api-token`. In production set `SERVICE_API_TOKEN` env var.
+function isValidServiceToken(req) {
+  try {
+    const provided = String(req.get('x-service-api-token') || req.query.serviceApiToken || req.body && req.body.serviceApiToken || '').trim();
+    if (!provided) return false;
+    return provided === String(process.env.SERVICE_API_TOKEN || '');
+  } catch (e) { return false; }
 }
 
 // POST /login endpoint
