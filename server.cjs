@@ -951,7 +951,7 @@ app.put('/api/orders/:id', async (req, res) => {
       // Ensure items array exists on the order
       existingOrder.items = Array.isArray(existingOrder.items) ? existingOrder.items : (updatedData.items || []);
 
-      // Coerce per-item numeric fields and compute total weight from items
+      // Coerce per-item numeric fields and compute total weight from islastems
       let totalFromItems = 0;
       for (let it of existingOrder.items) {
         if (!it) continue;
