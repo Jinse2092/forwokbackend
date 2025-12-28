@@ -589,24 +589,34 @@ app.post('/api/orders', async (req, res) => {
     req.isService = true;
   }
   console.log('POST /api/orders - Received order data:', JSON.stringify(orderData, null, 2));
-  if (!orderData.id) {
-    return res.status(400).json({ error: 'Order id is required' });
-  }
+  // Allow callers (e.g. Shopify listener) to omit `id`. Server will generate
+  // a canonical internal id when not provided. If callers include
+  // `shopifyWebhookId` + `merchantId`, use that to prevent duplicates.
   if (!orderData.date || !orderData.time) {
     const { date, time } = await fetchISTDateTime();
     orderData.date = date;
     orderData.time = time;
   }
   try {
-    const existingOrder = await Order.findOne({ id: orderData.id });
-    if (existingOrder) {
-      return res.status(409).json({ error: 'Order with this id already exists' });
+    // If caller provided a shopifyWebhookId + merchantId, check duplicate by that pair
+    if (orderData.shopifyWebhookId && orderData.merchantId) {
+      const dup = await Order.findOne({ shopifyWebhookId: String(orderData.shopifyWebhookId), merchantId: orderData.merchantId });
+      if (dup) {
+        console.log('POST /api/orders - duplicate detected for shopifyWebhookId, skipping creation:', orderData.shopifyWebhookId);
+        return res.status(200).json(dup);
+      }
+    }
+    // Ensure order id exists; generate server-side if omitted
+    if (!orderData.id) {
+      orderData.id = `ord-${Date.now()}-${Math.floor(Math.random()*1000)}`;
+      console.log('POST /api/orders - generated id for incoming order:', orderData.id);
     }
     
     // Explicitly ensure all fields are present with defaults
     const completeOrderData = {
       id: orderData.id,
       merchantId: orderData.merchantId,
+      shopifyWebhookId: orderData.shopifyWebhookId !== undefined ? String(orderData.shopifyWebhookId) : undefined,
       customerName: orderData.customerName || '',
       address: orderData.address || '',
       city: orderData.city || '',
@@ -823,6 +833,41 @@ app.get('/api/orders-debug/:id', async (req, res) => {
   }
 });
 
+// Get order by shopify webhook id + merchantId (used by listener to detect duplicates)
+app.get('/api/orders/shopify/:merchantId/:shopifyOrderId', async (req, res) => {
+  const { merchantId, shopifyOrderId } = req.params;
+  try {
+    // Try matching by explicit shopifyWebhookId first, then fall back to id 'shopify-<shopifyOrderId>'
+    const searchId = String(shopifyOrderId);
+    console.log(`GET /api/orders/shopify - searching for merchant=${merchantId} shopifyOrderId=${searchId}`);
+    const order = await Order.findOne({
+      merchantId,
+      $or: [
+        { shopifyWebhookId: searchId },
+        { id: `shopify-${searchId}` }
+      ]
+    });
+    if (!order) {
+      console.log(`GET /api/orders/shopify - no order found for merchant=${merchantId} shopifyOrderId=${shopifyOrderId}`);
+      // Extra diagnostics: try a looser search by id alone and by shopifyWebhookId alone
+      try {
+        const byIdOnly = await Order.findOne({ id: `shopify-${searchId}` });
+        if (byIdOnly) console.log('GET /api/orders/shopify - found by id only (merchant mismatch?):', byIdOnly.id, 'merchantId=', byIdOnly.merchantId);
+        const byWebhookOnly = await Order.findOne({ shopifyWebhookId: searchId });
+        if (byWebhookOnly) console.log('GET /api/orders/shopify - found by shopifyWebhookId only (merchant mismatch?):', byWebhookOnly.id, 'merchantId=', byWebhookOnly.merchantId);
+      } catch (diagErr) {
+        console.warn('GET /api/orders/shopify - diagnostic queries failed', diagErr && diagErr.message);
+      }
+      return res.status(404).json({ error: 'Not found' });
+    }
+    console.log(`GET /api/orders/shopify - matched order id=${order.id} merchantId=${order.merchantId}`);
+    return res.json(order.toObject ? order.toObject() : order);
+  } catch (err) {
+    console.error('GET /api/orders/shopify - error', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // PUT endpoint to update an order by id
 app.put('/api/orders/:id', async (req, res) => {
   const id = req.params.id;
@@ -840,6 +885,9 @@ app.put('/api/orders/:id', async (req, res) => {
       console.log(`Order with id ${id} not found`);
       return res.status(404).json({ error: 'Order not found' });
     }
+
+    // Capture original status before applying updates so we can detect transitions
+    const originalStatus = existingOrder.status;
 
     console.log(`PUT /api/orders/${id} - Existing order before update:`, JSON.stringify(existingOrder.toObject(), null, 2));
 
@@ -946,6 +994,44 @@ app.put('/api/orders/:id', async (req, res) => {
     // Save the updated order
     let savedOrder = await existingOrder.save();
     console.log(`PUT /api/orders/${id} - Updated order saved (initial save):`, JSON.stringify(savedOrder.toObject(), null, 2));
+
+    // If status transitioned to 'dispatched', notify the Shopify listener service
+    try {
+      const prevStatus = (originalStatus !== undefined && originalStatus !== null) ? String(originalStatus).toLowerCase() : '';
+      const newStatus = (savedOrder && savedOrder.status) ? String(savedOrder.status).toLowerCase() : '';
+      console.log(`PUT /api/orders/${id} - status transition check: prev='${prevStatus}' new='${newStatus}'`);
+      if (prevStatus !== 'dispatched' && newStatus === 'dispatched') {
+        // Determine shopifyOrderId to notify: prefer explicit shopifyWebhookId, otherwise extract from server id if it follows 'shopify-<id>' pattern
+        try {
+          if (!savedOrder.merchantId) {
+            console.log(`PUT /api/orders/${id} - missing merchantId; cannot notify listener`);
+          } else {
+            let shopifyOrderIdToSend = savedOrder.shopifyWebhookId ? String(savedOrder.shopifyWebhookId) : null;
+            if (!shopifyOrderIdToSend && savedOrder.id && String(savedOrder.id).startsWith('shopify-')) {
+              shopifyOrderIdToSend = String(savedOrder.id).slice('shopify-'.length);
+              console.log(`PUT /api/orders/${id} - derived shopifyOrderId from id: ${shopifyOrderIdToSend}`);
+            }
+            if (!shopifyOrderIdToSend) {
+              console.log(`PUT /api/orders/${id} - no shopifyWebhookId or derivable id; skipping listener notify`);
+            } else {
+              const notifyPayload = { 
+                merchantId: savedOrder.merchantId, 
+                shopifyOrderId: shopifyOrderIdToSend,
+                trackingCode: savedOrder.trackingCode || '',
+                courier: savedOrder.deliveryPartner || savedOrder.courier || ''
+              };
+              console.log(`PUT /api/orders/${id} - notifying listener of dispatch:`, notifyPayload);
+              const notifyResp = await axios.post('http://localhost:9001/fulfill', notifyPayload, { timeout: 5000, headers: { 'Content-Type': 'application/json' } });
+              console.log(`PUT /api/orders/${id} - listener responded: ${notifyResp.status} ${JSON.stringify(notifyResp.data)}`);
+            }
+          }
+        } catch (notifyErr) {
+          console.error(`PUT /api/orders/${id} - failed to notify listener:`, notifyErr && (notifyErr.response ? (notifyErr.response.status + ' ' + JSON.stringify(notifyErr.response.data)) : notifyErr.message || notifyErr));
+        }
+      }
+    } catch (notifyOuterErr) {
+      console.warn('PUT /api/orders - error while attempting to notify listener:', notifyOuterErr && notifyOuterErr.message);
+    }
 
     // Server-authoritative: when order is packed, compute per-item components and upsert PackingFee
     try {
@@ -1121,6 +1207,31 @@ app.put('/api/orders/:id', async (req, res) => {
   }
 });
 
+// Internal endpoint: atomically mark an order as fulfilled on Shopify to prevent duplicate fulfillments
+// Requires `x-service-api-token` header (internal services)
+app.post('/api/orders/:id/shopify-fulfilled', async (req, res) => {
+  const id = req.params.id;
+  if (!isValidServiceToken(req)) return res.status(403).json({ error: 'Invalid service token' });
+  try {
+    // Atomically set shopifyFulfilled flag if not already set
+    const updated = await Order.findOneAndUpdate(
+      { id, $or: [{ shopifyFulfilled: { $exists: false } }, { shopifyFulfilled: { $ne: true } }] },
+      { $set: { shopifyFulfilled: true, shopifyFulfilledAt: new Date().toISOString() } },
+      { new: true }
+    );
+    if (!updated) {
+      // Already fulfilled or not found
+      const existing = await Order.findOne({ id });
+      if (!existing) return res.status(404).json({ error: 'Order not found' });
+      return res.json({ message: 'already_marked' });
+    }
+    return res.json({ message: 'marked', order: updated });
+  } catch (err) {
+    console.error('POST /api/orders/:id/shopify-fulfilled error', err);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
+});
+
 // Add DELETE endpoint to remove an order by id
 app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
   const id = req.params.id;
@@ -1128,16 +1239,49 @@ app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
   try {
     const order = await Order.findOne({ id });
     if (!order) {
+      console.warn(`DELETE /api/orders/${id} - order not found`);
       return res.status(404).json({ error: 'Order not found' });
     }
+
+    // Log order metadata to help debug deletions (source/shopifyWebhookId)
+    console.log(`DELETE /api/orders/${id} - order found (source=${order.source}, shopifyWebhookId=${order.shopifyWebhookId}, merchantId=${order.merchantId})`);
+
     // Allow if requester is admin/superadmin or the merchant who owns the order
     const requester = req.user || {};
-    if (requester.role === 'admin' || requester.role === 'superadmin' || (requester.role === 'merchant' && requester.id === order.merchantId)) {
-      await Order.findOneAndDelete({ id });
-      // Optionally, also remove related transactions or perform cleanup here
-      return res.json({ message: 'Order deleted', id });
+    console.log(`DELETE /api/orders/${id} - requester info: ${JSON.stringify({ id: requester.id, role: requester.role })}`);
+
+    // Allow admins through immediately
+    if (requester.role === 'admin' || requester.role === 'superadmin') {
+      console.log(`DELETE /api/orders/${id} - requester is admin/superadmin; allowed`);
+    } else {
+      // More tolerant merchant ownership check for merchant role
+      function normalizeIdForCompare(val) {
+        if (val === undefined || val === null) return '';
+        let s = String(val).trim();
+        s = s.replace(/^merchant[-_:]?/i, '').replace(/^user[-_:]?/i, '');
+        s = s.replace(/^ObjectId\("?([a-f0-9]{24})"?\)$/i, '$1');
+        return s;
+      }
+      const requesterIdNorm = normalizeIdForCompare(requester.id);
+      const orderMerchantIdNorm = normalizeIdForCompare(order.merchantId);
+      console.log(`DELETE /api/orders/${id} - normalized ids: requester='${requesterIdNorm}' orderMerchant='${orderMerchantIdNorm}'`);
+      const merchantAllowed = requester.role === 'merchant' && (
+        (requesterIdNorm && orderMerchantIdNorm && requesterIdNorm === orderMerchantIdNorm)
+        || String(requester.id) === String(order.merchantId)
+        || String(order.merchantId).startsWith(String(requester.id))
+        || String(requester.id).startsWith(String(order.merchantId))
+      );
+      if (!merchantAllowed) {
+        console.warn(`DELETE /api/orders/${id} - forbidden: requester.id=${requester.id} requester.role=${requester.role} order.merchantId=${order.merchantId}`);
+        return res.status(403).json({ error: 'Forbidden: insufficient permissions to delete order', diagnostics: { requesterId: requester.id, orderMerchantId: order.merchantId } });
+      }
     }
-    return res.status(403).json({ error: 'Forbidden: insufficient permissions to delete order' });
+
+    // Proceed to delete
+    await Order.deleteOne({ id });
+    // Optional: log the deletion result for auditing
+    console.log(`DELETE /api/orders/${id} - successfully deleted`);
+    return res.json({ message: 'Order deleted', id });
   } catch (err) {
     console.error('Error deleting order:', err);
     res.status(500).json({ error: 'Internal Server Error' });
