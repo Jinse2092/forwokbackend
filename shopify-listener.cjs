@@ -1,0 +1,549 @@
+const express = require("express");
+const mongoose = require("mongoose");
+const axios = require("axios");
+
+const app = express();
+app.use(express.json());
+
+// Simple sleep helper
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Normalize courier partner names to Shopify tracking company identifiers
+function normalizeCourier(name) {
+  if (!name) return '';
+  const s = String(name).toLowerCase();
+  if (s.includes('delhivery')) return 'delhivery';
+  if (s.includes('dtdc')) return 'dtdc';
+  if (s.includes('ekart')) return 'ekart';
+  if (s.includes('shadowfax')) return 'shadowfax';
+  if (s.includes('blueddart') || s.includes('dart') || s.includes('blue dart')) return 'bluedart';
+  if (s.includes('fedex')) return 'fedex';
+  return s.replace(/[^a-z0-9 ]/g,'').split(' ')[0] || s;
+}
+
+// Robust request wrapper that handles Shopify 429s
+async function safeAxiosRequest(fn, opts = {}) {
+  const maxRetries = opts.maxRetries || 5;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await fn();
+    } catch (err) {
+      attempt++;
+      const status = err && err.response && err.response.status;
+      if (status === 429 && attempt <= maxRetries) {
+        const retryAfter = parseInt(err.response.headers['retry-after'] || err.response.headers['Retry-After'] || '1', 10) || 1;
+        const wait = Math.max(1000 * retryAfter, 1000 * Math.pow(2, attempt));
+        console.warn('Rate limited by Shopify, retrying after', wait, 'ms');
+        await sleep(wait);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/* -------------------- MongoDB -------------------- */
+
+mongoose.connect(
+  "mongodb+srv://LEO:leo112944@cluster0.ye9exkm.mongodb.net/forvoqdb",
+  { useNewUrlParser: true, useUnifiedTopology: true }
+);
+
+mongoose.connection.once("open", () => {
+  console.log("✅ MongoDB connected (Atlas)");
+});
+
+/* -------------------- Schemas -------------------- */
+
+const webhookSchema = new mongoose.Schema({}, { strict: false });
+const productSchema = new mongoose.Schema({}, { strict: false });
+const processedSchema = new mongoose.Schema(
+  {
+    shopifyOrderId: { type: String, unique: true },
+    createdAt: { type: Date, default: Date.now },
+  },
+  { collection: "processed_shopify_orders" }
+);
+
+/* SAFE model loading (prevents overwrite error) */
+const Webhook =
+  mongoose.models.Webhook || mongoose.model("Webhook", webhookSchema);
+const Product =
+  mongoose.models.Product || mongoose.model("Product", productSchema);
+const ProcessedOrder =
+  mongoose.models.ProcessedOrder ||
+  mongoose.model("ProcessedOrder", processedSchema);
+
+/* -------------------- Middleware -------------------- */
+
+app.post(
+  "/shopify",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      console.log("🔔 Shopify webhook received");
+
+      const payload = JSON.parse(req.body.toString());
+      const shopDomain = req.headers["x-shopify-shop-domain"];
+      const shopifyOrderId = String(payload.id);
+
+      console.log("🏪 Shopify Store:", shopDomain);
+      console.log("🛒 Shopify Order ID:", shopifyOrderId);
+
+      /* ---------- Duplicate protection ---------- */
+      const alreadyProcessed = await ProcessedOrder.findOne({
+        shopifyOrderId,
+      });
+      if (alreadyProcessed) {
+        console.log("⚠️ Duplicate order ignored");
+        return res.status(200).send("Duplicate ignored");
+      }
+
+      /* ---------- Merchant resolution ---------- */
+      const webhook = await Webhook.findOne({
+        shopifyDomain: shopDomain,
+        active: true,
+      });
+
+      if (!webhook) {
+        console.log("❌ No merchant mapped for shop");
+        return res.status(200).send("Unknown merchant");
+      }
+
+      const merchantId = webhook.merchantId;
+      console.log("🆔 Merchant ID:", merchantId);
+
+      /* ---------- Load products ---------- */
+      const products = await Product.find({ merchantId });
+      console.log("📦 Products in DB:", products.length);
+
+      const productMap = {};
+      products.forEach((p) => {
+        if (p.sku) productMap[p.sku.toLowerCase()] = p;
+      });
+
+      /* ---------- Match line items ---------- */
+      const matchedItems = [];
+      const unmatchedItems = [];
+
+      for (const item of payload.line_items || []) {
+        const sku = (item.sku || "").toLowerCase();
+        const product = productMap[sku];
+
+        if (!product) {
+          unmatchedItems.push({
+            shopifySku: item.sku,
+            title: item.title,
+          });
+          continue;
+        }
+
+        const qty = Number(item.quantity) || 1;
+        const weightPerItem = Number(product.weightKg || 0);
+        const weightKg = weightPerItem * qty;
+
+        matchedItems.push({
+          productId: product.id,
+          name: product.name,
+          quantity: qty,
+          weightPerItemKg: weightPerItem,
+          weightKg,
+        });
+      }
+
+      console.log("📊 MATCH SUMMARY");
+      console.log("✅ Matched Items:", matchedItems);
+      console.log("❌ Unmatched Items:", unmatchedItems);
+
+      if (matchedItems.length === 0) {
+        return res.status(200).send("No shippable items");
+      }
+
+      /* ---------- Build order payload ---------- */
+      const now = new Date();
+      const date = now.toISOString().split("T")[0];
+      const time = now.toTimeString().split(" ")[0];
+
+      const shipping = payload.shipping_address || {};
+
+      const orderPayload = {
+        id: `shopify-${shopifyOrderId}`,
+        merchantId,
+        customerName:
+          `${shipping.first_name || ""} ${shipping.last_name || ""}`.trim(),
+        address: shipping.address1 || "",
+        city: shipping.city || "",
+        state: shipping.province || "",
+        pincode: shipping.zip || "",
+        phone: shipping.phone || payload.phone || "",
+        items: matchedItems,
+        totalWeightKg: matchedItems.reduce(
+          (s, i) => s + (i.weightKg || 0),
+          0
+        ),
+        source: "shopify",
+        status: "pending",
+        date,
+        time,
+      };
+
+      /* ---------- Send to Orders API ---------- */
+      await axios.post(
+        "http://localhost:4000/api/orders",
+        orderPayload,
+        {
+          timeout: 8000,
+          headers: {
+            'x-service-api-token': 'listener@2025'
+          }
+        }
+      );
+
+      /* ---------- Mark processed ---------- */
+      await ProcessedOrder.create({ shopifyOrderId });
+
+      console.log("✅ Order forwarded to Orders API");
+      res.status(200).send("OK");
+    } catch (err) {
+      console.error("❌ Shopify webhook error:", err.message);
+      res.status(200).send("Webhook error");
+    }
+  }
+);
+
+// Endpoint: listener receives fulfillment notification from server
+// Listener endpoint: accept single-order fulfillment requests only. Payload MUST contain merchantId, shopifyOrderId, trackingCode, courier
+app.post('/fulfill', async (req, res) => {
+  try {
+    const { merchantId, shopifyOrderId, trackingCode, courier } = req.body || {};
+    console.log('/fulfill received:', { merchantId, shopifyOrderId, trackingCode, courier });
+    if (!merchantId || !shopifyOrderId || !trackingCode) return res.status(400).json({ error: 'merchantId, shopifyOrderId and trackingCode required' });
+
+    // Resolve merchant webhook/token
+    const webhook = await Webhook.findOne({ merchantId, active: true });
+    if (!webhook) return res.status(404).json({ error: 'merchant webhook not found' });
+    const shopDomain = webhook.shopifyDomain;
+    const token = webhook.signature;
+
+    // Fetch backend order to check shopifyFulfilled lock and get internal id
+    let orderResp;
+    try {
+      orderResp = await axios.get(`http://localhost:4000/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
+    } catch (e) {
+      console.error('Fulfill: failed to fetch order from backend', e && (e.response ? (e.response.status + ' ' + JSON.stringify(e.response.data)) : e.message));
+      return res.status(500).json({ error: 'Failed to fetch order from backend' });
+    }
+
+    const order = orderResp.data;
+    // If backend already marked fulfilled, exit immediately
+    if (order && order.shopifyFulfilled) {
+      console.log('Fulfill: order already marked shopifyFulfilled; skipping', shopifyOrderId);
+      return res.json({ message: 'already_fulfilled' });
+    }
+
+    // Normalize courier before sending to Shopify
+    let normalizedCourier = normalizeCourier(courier || '');
+    if (!normalizedCourier) normalizedCourier = 'Other';
+
+    // Use Fulfillment Orders API: GET fulfillment_orders, then POST to fulfillment_orders/{id}/fulfillments.json
+    try {
+      const foUrl = `https://${shopDomain}/admin/api/2024-01/orders/${shopifyOrderId}/fulfillment_orders.json`;
+      console.log('Fulfill: fetching fulfillment_orders for order', { foUrl });
+      const foResp = await safeAxiosRequest(() => axios.get(foUrl, { headers: { 'X-Shopify-Access-Token': token }, timeout: 10000 }));
+      const fulfillmentOrders = foResp && foResp.data && foResp.data.fulfillment_orders ? foResp.data.fulfillment_orders : [];
+      if (!fulfillmentOrders.length) {
+        console.warn('Fulfill: no fulfillment_orders found for order', shopifyOrderId);
+        // Fetch the full order for diagnostics and attempt legacy fulfillment as a fallback
+        try {
+          const orderDetailUrl = `https://${shopDomain}/admin/api/2024-01/orders/${shopifyOrderId}.json`;
+          console.log('Fulfill: fetching full order for diagnostics', { orderDetailUrl });
+          const orderDetailResp = await safeAxiosRequest(() => axios.get(orderDetailUrl, { headers: { 'X-Shopify-Access-Token': token }, timeout: 10000 }));
+          console.log('Fulfill: order details fetched for diagnostics');
+          // Log a compact but informative snapshot for debugging (not too huge)
+          try { console.log(JSON.stringify(orderDetailResp.data, null, 2)); } catch(e) { console.log('Fulfill: could not stringify order details'); }
+
+          const orderData = orderDetailResp.data && orderDetailResp.data.order;
+          const line_items = (orderData && orderData.line_items) ? orderData.line_items.map(li => ({ id: li.id, quantity: li.quantity })) : [];
+
+          // Try to determine a location_id if present on the order or line items
+          let locationId = orderData && orderData.location_id;
+          // Prefer an explicitly configured location id from the webhook record (settable from admin)
+          if (!locationId && webhook && webhook.fulfillmentLocationId) {
+            locationId = webhook.fulfillmentLocationId;
+            console.log('Fulfill: using configured fulfillmentLocationId from webhook:', locationId);
+          }
+          if (!locationId) {
+            // Attempt to resolve a valid location via the Locations API as a best-effort
+            try {
+              const locsResp = await safeAxiosRequest(() => axios.get(`https://${shopDomain}/admin/api/2024-01/locations.json`, { headers: { 'X-Shopify-Access-Token': token }, timeout: 10000 }));
+              const locs = locsResp && locsResp.data && locsResp.data.locations ? locsResp.data.locations : [];
+              if (Array.isArray(locs) && locs.length) {
+                locationId = locs[0].id;
+                console.log('Fulfill: resolved fallback location_id for legacy fulfillment:', locationId);
+              } else {
+                console.log('Fulfill: no locations returned from Locations API; leaving location_id undefined');
+              }
+            } catch (locErr) {
+              console.warn('Fulfill: failed to fetch locations for fallback location_id', locErr && (locErr.response ? (locErr.response.status + ' ' + JSON.stringify(locErr.response.data)) : locErr.message));
+              locationId = undefined;
+            }
+          }
+
+          if (!line_items.length) {
+            console.error('Fulfill: no line_items available for legacy fulfillment fallback', shopifyOrderId);
+            return res.status(400).json({ error: 'No fulfillment_orders and no line_items for legacy fulfillment' });
+          }
+
+          // Build legacy fulfillment payload (older endpoint). Include location_id only when available.
+          // Simplify legacy payload: include both tracking_number and tracking_numbers,
+          // and send only `id` for line_items (Shopify expects line item ids)
+          const legacyFulfillPayload = {
+            fulfillment: {
+              tracking_number: trackingCode || undefined,
+              tracking_numbers: trackingCode ? [trackingCode] : [],
+              tracking_company: normalizedCourier,
+              notify_customer: true,
+              line_items: (line_items || []).map(li => ({ id: li.id }))
+            }
+          };
+          if (locationId) legacyFulfillPayload.fulfillment.location_id = locationId;
+
+          // Attempt legacy fulfillment endpoint as a fallback
+          try {
+            const legacyUrl = `https://${shopDomain}/admin/api/2024-01/orders/${shopifyOrderId}/fulfillments.json`;
+            console.log('Fulfill: attempting legacy fulfillment endpoint', { legacyUrl, payload: legacyFulfillPayload });
+            const legacyResp = await safeAxiosRequest(() => axios.post(legacyUrl, legacyFulfillPayload, { headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 15000 }));
+            console.log('Fulfill: legacy Shopify fulfillment response', { status: legacyResp.status, data: legacyResp && legacyResp.data ? legacyResp.data : 'no-body' });
+
+            // Mark order fulfilled on backend to create a lock (atomic endpoint)
+            try {
+              const internalId = order && (order.id || order._id);
+              if (internalId) {
+                const markUrl = `http://localhost:4000/api/orders/${internalId}/shopify-fulfilled`;
+                const markResp = await axios.post(markUrl, {}, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
+                console.log('Fulfill: backend mark-shopify-fulfilled response (legacy)', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
+              }
+            } catch (markErr) {
+              console.warn('Fulfill: failed to mark order fulfilled on backend (legacy)', markErr && (markErr.response ? (markErr.response.status + ' ' + JSON.stringify(markErr.response.data)) : markErr.message));
+            }
+
+            return res.json({ message: 'fulfilled-legacy', shopifyResponseStatus: legacyResp.status, shopifyResponse: legacyResp.data });
+          } catch (legacyErr) {
+            // Log full response object when available for deep diagnostics
+            try {
+              if (legacyErr && legacyErr.response) {
+                console.error('Fulfill: legacy fulfillment failed - status:', legacyErr.response.status);
+                try { console.error('Fulfill: legacy response data:', JSON.stringify(legacyErr.response.data)); } catch(e) { console.error('Fulfill: could not stringify legacy response data'); }
+                console.error('Fulfill: legacy response headers:', legacyErr.response.headers);
+              } else {
+                console.error('Fulfill: legacy fulfillment error (no response):', legacyErr && legacyErr.message);
+              }
+            } catch (logErr) {
+              console.error('Fulfill: error while logging legacyErr', logErr && logErr.message);
+            }
+            // Construct a rich details object to return to caller for debugging (non-sensitive)
+            const legacyDetails = {
+              message: legacyErr && legacyErr.message,
+              status: legacyErr && legacyErr.response && legacyErr.response.status,
+              data: legacyErr && legacyErr.response && legacyErr.response.data,
+              headers: legacyErr && legacyErr.response && legacyErr.response.headers
+            };
+            return res.status(500).json({ error: 'No fulfillment_orders and legacy fulfillment failed', details: legacyDetails });
+          }
+        } catch (orderErr) {
+          console.error('Fulfill: failed to fetch order details for diagnostics', orderErr && (orderErr.response ? (orderErr.response.status + ' ' + JSON.stringify(orderErr.response.data)) : orderErr.message));
+          return res.status(400).json({ error: 'No fulfillment_orders for order' });
+        }
+      }
+
+      // Use the first fulfillment_order (most common case). Only fulfill that single FO.
+      const fo = fulfillmentOrders[0];
+      const fulfillUrl = `https://${shopDomain}/admin/api/2024-01/fulfillment_orders/${fo.id}/fulfillments.json`;
+      const payload = {
+        fulfillment: {
+          notify_customer: true,
+          tracking_info: {
+            number: trackingCode,
+            company: normalizedCourier
+          },
+          line_items_by_fulfillment_order: []
+        }
+      };
+
+      console.log('Fulfill: POSTing fulfillment to fulfillment_order', { fulfillUrl, payload });
+      const postResp = await safeAxiosRequest(() => axios.post(fulfillUrl, payload, { headers: { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json' }, timeout: 15000 }));
+      console.log('Fulfill: Shopify fulfillment response', { status: postResp.status, data: postResp && postResp.data ? postResp.data : 'no-body' });
+
+      // Mark order fulfilled on backend to create a lock (atomic endpoint)
+      try {
+        // Use internal order id to mark
+        const internalId = order.id || order._id;
+        if (internalId) {
+          const markUrl = `http://localhost:4000/api/orders/${internalId}/shopify-fulfilled`;
+          const markResp = await axios.post(markUrl, {}, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
+          console.log('Fulfill: backend mark-shopify-fulfilled response', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
+        }
+      } catch (markErr) {
+        console.warn('Fulfill: failed to mark order fulfilled on backend', markErr && (markErr.response ? (markErr.response.status + ' ' + JSON.stringify(markErr.response.data)) : markErr.message));
+      }
+
+      return res.json({ message: 'fulfilled', shopifyResponseStatus: postResp.status, shopifyResponse: postResp.data });
+    } catch (err) {
+      console.error('Fulfill: failed during fulfillment flow', err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
+      return res.status(500).json({ error: 'Fulfillment failed', details: err && (err.response ? err.response.data : err.message) });
+    }
+  } catch (err) {
+    console.error('Fulfill endpoint error', err && err.message);
+    return res.status(500).json({ error: 'Internal Error' });
+  }
+});
+
+// Periodic shopify order fetch flow
+async function fetchOrdersForMerchant(webhook) {
+  const shopDomain = webhook.shopifyDomain;
+  const token = webhook.signature;
+  const merchantId = webhook.merchantId;
+  if (!shopDomain || !token || !merchantId) {
+    console.log('Skipping merchant due to missing data', merchantId);
+    return;
+  }
+  try {
+    // Compute time window: yesterday 16:00 -> now (local timezone)
+    const now = new Date();
+    const today4pm = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 16, 0, 0);
+    // Start is always yesterday 16:00
+    const start = new Date(today4pm.getTime() - 24 * 60 * 60 * 1000);
+    const end = now;
+    const created_at_min = start.toISOString();
+    const created_at_max = end.toISOString();
+
+    const url = `https://${shopDomain}/admin/api/2024-01/orders.json`;
+    console.log(`Fetching orders for ${merchantId}@${shopDomain} window ${created_at_min} -> ${created_at_max} (yesterday 16:00 -> now)`);
+
+    const resp = await safeAxiosRequest(() => axios.get(url, { params: { created_at_min, created_at_max, fulfillment_status: 'unfulfilled' }, headers: { 'X-Shopify-Access-Token': token }, timeout: 15000 }));
+    const orders = (resp && resp.data && resp.data.orders) ? resp.data.orders : [];
+    console.log(`Fetched ${orders.length} orders for ${shopDomain}`);
+
+    for (const o of orders) {
+      const shopifyOrderId = String(o.id);
+      console.log(`Processing fetched order ${shopifyOrderId} for merchant ${merchantId}`);
+      try {
+        // Check for duplicate in backend
+        try {
+          const existsResp = await axios.get(`http://localhost:4000/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
+          console.log(`Exists check for ${shopifyOrderId}: status=${existsResp.status}`, existsResp && existsResp.data ? existsResp.data : 'no-body');
+          if (existsResp && existsResp.status === 200) {
+            console.log(`Order ${shopifyOrderId} already exists in backend; skipping`);
+            continue;
+          }
+        } catch (e) {
+          if (e && e.response && e.response.status === 404) {
+            console.log(`Order ${shopifyOrderId} not found in backend; will attempt create`);
+          } else {
+            console.warn('Error checking order existence; will skip this order and continue', e && (e.response ? (e.response.status + ' ' + JSON.stringify(e.response.data)) : e.message));
+            continue;
+          }
+        }
+
+        // Build minimal order payload for backend - include id as 'shopify-<shopifyOrderId>'
+        const shipping = o.shipping_address || {};
+
+        // Load products for this merchant so we can map SKUs -> productId/name
+        const productsForMerchant = await Product.find({ merchantId });
+        const productMap = {};
+        productsForMerchant.forEach(p => { if (p.sku) productMap[String(p.sku).toLowerCase()] = p; });
+
+        const matchedItems = [];
+        const unmatchedItems = [];
+        for (const li of (o.line_items || [])) {
+          const skuRaw = li.sku || li.variant_sku || '';
+          const sku = String(skuRaw).toLowerCase();
+          const qty = Number(li.quantity || 0) || 1;
+          const prod = productMap[sku];
+          if (prod) {
+            const weightPerItem = Number(prod.weightKg || 0);
+            matchedItems.push({ productId: prod.id, name: prod.name, quantity: qty, weightPerItemKg: weightPerItem, weightKg: weightPerItem * qty });
+          } else {
+            unmatchedItems.push({ sku: skuRaw, title: li.title || '' });
+            matchedItems.push({ sku: skuRaw, quantity: qty });
+          }
+        }
+
+        if (unmatchedItems.length) console.log('fetchOrdersForMerchant - unmatched SKUs:', unmatchedItems);
+
+        const payload = {
+          id: `shopify-${shopifyOrderId}`,
+          shopifyWebhookId: shopifyOrderId,
+          merchantId: merchantId,
+          customerName: `${shipping.first_name || ''} ${shipping.last_name || ''}`.trim() || (o.contact_email || ''),
+          address: shipping.address1 || '',
+          city: shipping.city || '',
+          state: shipping.province || '',
+          pincode: shipping.zip || '',
+          phone: shipping.phone || o.phone || '',
+          items: matchedItems,
+          source: 'shopify'
+        };
+
+        try {
+          const postResp = await axios.post('http://localhost:4000/api/orders', payload, { timeout: 10000, headers: { 'x-service-api-token': 'listener@2025' } });
+          console.log(`Created order in backend for shopifyOrderId=${shopifyOrderId}: status=${postResp.status}`, postResp && postResp.data ? postResp.data : 'no-body');
+        } catch (postErr) {
+          console.error('Failed to create order in backend for', shopifyOrderId, postErr && (postErr.response ? (postErr.response.status + ' ' + JSON.stringify(postErr.response.data)) : postErr.message));
+        }
+      } catch (inner) {
+        console.error('Error processing shopify order', o && o.id, inner && inner.message);
+      }
+      // Slightly longer pause between orders to reduce burst and give DB time
+      await sleep(500);
+    }
+  } catch (err) {
+    console.error('Error fetching orders for merchant', merchantId, err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
+  }
+}
+
+// Sequentially process all merchants
+async function processAllMerchants() {
+  try {
+    const merchants = await Webhook.find({ active: true });
+    console.log(`Processing ${merchants.length} active merchants sequentially`);
+    for (const m of merchants) {
+      try {
+        await fetchOrdersForMerchant(m);
+      } catch (e) {
+        console.error('Error processing merchant', m && m.merchantId, e && e.message);
+      }
+      // Small pause between merchants to reduce rate pressure
+      await sleep(500);
+    }
+  } catch (err) {
+    console.error('processAllMerchants error', err && err.message);
+  }
+}
+
+// Kick off on start and every N minutes
+const POLL_MINUTES = Number(process.env.SHOPIFY_POLL_MINUTES || 15);
+(async () => {
+  try {
+    await processAllMerchants();
+    setInterval(() => {
+      processAllMerchants().catch(e => console.error('Periodic fetch error', e));
+    }, POLL_MINUTES * 60 * 1000);
+  } catch (e) {
+    console.error('Initial merchant processing failed', e && e.message);
+  }
+})();
+
+/* -------------------- Health -------------------- */
+
+app.get("/", (req, res) => {
+  res.send("Shopify listener running");
+});
+
+const PORT = 9001;
+app.listen(PORT, () => {
+  console.log(`🚀 Shopify listener listening on port ${PORT}`);
+});
