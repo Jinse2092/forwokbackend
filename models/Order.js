@@ -13,7 +13,22 @@ const orderSchema = new mongoose.Schema({
     {
       productId: String,
       name: String,
+        expiryDate: String,
       quantity: Number,
+    }
+  ],
+  // Packing details: allocations of order items to specific inventory batches
+  packingDetails: [
+    {
+      productId: String,
+      allocations: [
+        {
+          inventoryId: String,
+          expiryDate: String,
+          sourceInboundDate: String,
+          used: Number
+        }
+      ]
     }
   ],
   status: String,

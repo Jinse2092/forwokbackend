@@ -4,6 +4,7 @@ const inventorySchema = new mongoose.Schema({
   id: String,
   productId: String,
   merchantId: String,
+  expiryDate: String,
   quantity: Number,
   packedQuantity: { type: Number, default: 0 },
   location: String,

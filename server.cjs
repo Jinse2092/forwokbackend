@@ -992,6 +992,79 @@ app.put('/api/orders/:id', async (req, res) => {
     }, null, 2));
 
     // Save the updated order
+    // If status transitioned to 'packed', attempt to allocate expiry-safe inventory batches
+    if (existingOrder.status === 'packed' && originalStatus !== 'packed') {
+      try {
+        const orderDate = existingOrder.date ? new Date(existingOrder.date) : new Date();
+        const threshold = new Date(orderDate);
+        threshold.setDate(threshold.getDate() + 3);
+
+        const insufficient = [];
+        const allocationsToApply = [];
+
+        for (const item of existingOrder.items || []) {
+          let remaining = Number(item.quantity || 0);
+          // fetch all batches for this product+merchant
+          const batches = await Inventory.find({ productId: item.productId, merchantId: existingOrder.merchantId }).lean();
+          // sort by expiry (earliest first). treat missing expiry as far future
+          batches.sort((a, b) => {
+            const da = a.expiryDate ? new Date(a.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+            const db = b.expiryDate ? new Date(b.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
+            return da - db;
+          });
+
+          const allocations = [];
+          for (const batch of batches) {
+            // skip batches that expire before threshold
+            if (batch.expiryDate) {
+              const be = new Date(batch.expiryDate);
+              if (isNaN(be.getTime()) || be.getTime() < threshold.getTime()) continue;
+            }
+            const avail = Number(batch.quantity || 0);
+            if (avail <= 0) continue;
+            const use = Math.min(avail, remaining);
+            allocations.push({ id: batch.id, use });
+            remaining -= use;
+            if (remaining <= 0) break;
+          }
+
+          if (remaining > 0) {
+            insufficient.push({ productId: item.productId, missing: remaining });
+          } else {
+            allocationsToApply.push({ productId: item.productId, allocations });
+          }
+        }
+
+        if (insufficient.length > 0) {
+          // Build readable message using product ids (avoid awaiting inside map here)
+          const details = insufficient.map(s => `${s.productId} (missing ${s.missing})`).join(', ');
+          return res.status(400).json({ error: 'Insufficient expiry-safe stock for packing', details });
+        }
+
+        // Apply allocations (decrement inventory quantities) and record packingDetails on the order
+        const packingDetails = [];
+        for (const entry of allocationsToApply) {
+          const pd = { productId: entry.productId, allocations: [] };
+          for (const a of entry.allocations) {
+            // fetch batch metadata to record expiry/sourceInbound
+            const invDoc = await Inventory.findOne({ id: a.id }).lean();
+            const expiryDate = invDoc && invDoc.expiryDate ? String(invDoc.expiryDate) : null;
+            const sourceInboundDate = invDoc && invDoc.sourceInboundDate ? String(invDoc.sourceInboundDate) : null;
+            // atomic decrement
+            await Inventory.findOneAndUpdate({ id: a.id }, { $inc: { quantity: -a.use } });
+            pd.allocations.push({ inventoryId: a.id, expiryDate, sourceInboundDate, used: a.use });
+          }
+          packingDetails.push(pd);
+        }
+
+        // attach packingDetails to the order so downstream reads and UI can attribute
+        existingOrder.packingDetails = packingDetails;
+      } catch (allocErr) {
+        console.error('Allocation error while packing:', allocErr);
+        return res.status(500).json({ error: 'Allocation failed', details: allocErr.message });
+      }
+    }
+
     let savedOrder = await existingOrder.save();
     console.log(`PUT /api/orders/${id} - Updated order saved (initial save):`, JSON.stringify(savedOrder.toObject(), null, 2));
 
@@ -1246,15 +1319,24 @@ app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
     // Log order metadata to help debug deletions (source/shopifyWebhookId)
     console.log(`DELETE /api/orders/${id} - order found (source=${order.source}, shopifyWebhookId=${order.shopifyWebhookId}, merchantId=${order.merchantId})`);
 
-    // Allow if requester is admin/superadmin or the merchant who owns the order
+    // Authorization rules:
+    // - `superadmin` may delete any order.
+    // - `admin` may delete only orders with status 'pending'.
+    // - `merchant` may delete only their own orders and only when status is 'pending'.
     const requester = req.user || {};
     console.log(`DELETE /api/orders/${id} - requester info: ${JSON.stringify({ id: requester.id, role: requester.role })}`);
 
-    // Allow admins through immediately
-    if (requester.role === 'admin' || requester.role === 'superadmin') {
-      console.log(`DELETE /api/orders/${id} - requester is admin/superadmin; allowed`);
+    const orderStatus = String(order.status || '').toLowerCase();
+    if (requester.role === 'superadmin') {
+      console.log(`DELETE /api/orders/${id} - requester is superadmin; allowed to delete any order`);
+    } else if (orderStatus !== 'pending') {
+      // Non-pending orders require superadmin privileges
+      console.warn(`DELETE /api/orders/${id} - forbidden: non-pending order deletion requires superadmin (requester.role=${requester.role})`);
+      return res.status(403).json({ error: 'Forbidden: only superadmin can delete non-pending orders' });
+    } else if (requester.role === 'admin') {
+      console.log(`DELETE /api/orders/${id} - requester is admin and order is pending; allowed`);
     } else {
-      // More tolerant merchant ownership check for merchant role
+      // Merchant ownership check for pending orders
       function normalizeIdForCompare(val) {
         if (val === undefined || val === null) return '';
         let s = String(val).trim();
@@ -1277,11 +1359,65 @@ app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
       }
     }
 
-    // Proceed to delete
+    // Before deleting the order, attempt to restock inventory for packed items.
+    const restocked = [];
+    try {
+      // Only restock for actual sales (not returns)
+      if (order && String(order.status).toLowerCase() !== 'return') {
+        // If server recorded packingDetails (per-batch allocations), use them to undo.
+        if (Array.isArray(order.packingDetails) && order.packingDetails.length > 0) {
+          for (const pd of order.packingDetails) {
+            for (const alloc of pd.allocations || []) {
+              try {
+                if (alloc && alloc.inventoryId && Number(alloc.used || 0) > 0) {
+                  const updated = await Inventory.findOneAndUpdate({ id: alloc.inventoryId }, { $inc: { quantity: Number(alloc.used || 0) } }, { new: true });
+                  restocked.push({ inventoryId: alloc.inventoryId, used: Number(alloc.used || 0), newQuantity: updated ? Number(updated.quantity || 0) : null });
+                }
+              } catch (inner) {
+                console.warn(`DELETE /api/orders/${id} - failed to restock inventoryId=${alloc && alloc.inventoryId}`, inner && inner.message);
+              }
+            }
+          }
+        } else {
+          // When packingDetails is missing, attempt a conservative exact-match restock:
+          // for each order item, find an inventory batch with the same productId,
+          // merchantId and expiryDate (explicit match, null when not provided). If
+          // found, increment that batch; otherwise create a new batch with the
+          // same expiry so the returned quantity is attributed correctly.
+          for (const it of order.items || []) {
+            try {
+              const qtyToReturn = Number(it.quantity || 0);
+              if (!qtyToReturn) continue;
+              const expiryKey = it.expiryDate ? String(it.expiryDate) : null;
+              // exact-match by expiry (null allowed)
+              const invMatch = await Inventory.findOne({ productId: it.productId, merchantId: order.merchantId, expiryDate: expiryKey });
+              if (invMatch) {
+                const updatedDoc = await Inventory.findOneAndUpdate({ id: invMatch.id }, { $inc: { quantity: qtyToReturn } }, { new: true });
+                restocked.push({ inventoryId: invMatch.id, used: qtyToReturn, newQuantity: updatedDoc ? Number(updatedDoc.quantity || 0) : null });
+              } else {
+                // create a new batch with the same expiry so returned stock is tracked
+                const newInv = new Inventory({ id: `inv-${Date.now()}-${Math.floor(Math.random()*1000)}`, productId: it.productId, merchantId: order.merchantId, quantity: qtyToReturn, expiryDate: expiryKey, location: 'Default Warehouse' });
+                try {
+                  const saved = await newInv.save();
+                  restocked.push({ inventoryId: saved.id, used: qtyToReturn, newQuantity: Number(saved.quantity || 0) });
+                } catch (e) {
+                  console.warn(`DELETE /api/orders/${id} - failed creating fallback inventory for product ${it.productId}`, e && e.message);
+                }
+              }
+            } catch (inner2) {
+              console.warn(`DELETE /api/orders/${id} - exact-match restock failed for item ${it && it.productId}`, inner2 && inner2.message);
+            }
+          }
+        }
+      }
+    } catch (restockErr) {
+      console.warn(`DELETE /api/orders/${id} - restock attempt failed:`, restockErr && restockErr.message);
+    }
+
+    // Proceed to delete the order
     await Order.deleteOne({ id });
-    // Optional: log the deletion result for auditing
-    console.log(`DELETE /api/orders/${id} - successfully deleted`);
-    return res.json({ message: 'Order deleted', id });
+    console.log(`DELETE /api/orders/${id} - successfully deleted; restocked:`, restocked);
+    return res.json({ message: 'Order deleted', id, restocked });
   } catch (err) {
     console.error('Error deleting order:', err);
     res.status(500).json({ error: 'Internal Server Error' });
@@ -1299,6 +1435,12 @@ const inventorySchema = new mongoose.Schema({
   dispatchedQuantity: { type: Number, default: 0 },
   packedQuantity: { type: Number, default: 0 },
   quantity: Number,
+  // Optional expiry date for batch (ISO string). When present, inventory with different expiryDate
+  // are treated as separate batches.
+  expiryDate: { type: String, default: null },
+  // status: 'normal' | 'about_to_expire' | 'expired'
+  status: { type: String, default: 'normal' },
+  lastStatusUpdated: { type: String, default: '' },
   location: String,
   minStockLevel: Number,
   maxStockLevel: Number,
@@ -1332,6 +1474,7 @@ const inboundSchema = new mongoose.Schema({
     {
       productId: String,
       quantity: Number,
+      expiryDate: String,
       location: String,
     }
   ],
@@ -1497,6 +1640,45 @@ app.delete('/api/products/:id', async (req, res) => {
 app.get('/api/inventory', async (req, res) => {
   try {
     const inventory = await Inventory.find();
+
+    // Compute expiry status per item and persist any changes on refresh
+    const ops = [];
+    const now = new Date();
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    inventory.forEach(inv => {
+      let computed = 'normal';
+      if (inv.expiryDate) {
+        const exp = new Date(inv.expiryDate);
+        if (!isNaN(exp.getTime())) {
+          const diffMs = exp.setHours(0,0,0,0) - startOfToday.getTime();
+          const diffDays = Math.ceil(diffMs / (24 * 60 * 60 * 1000));
+          if (diffDays <= 3) computed = 'expired';
+          else if (diffDays <= 10) computed = 'about_to_expire';
+          else computed = 'normal';
+        }
+      }
+      if (inv.status !== computed) {
+        ops.push({
+          updateOne: {
+            filter: { id: inv.id },
+            update: { $set: { status: computed, lastStatusUpdated: new Date().toISOString() } }
+          }
+        });
+      }
+    });
+
+    if (ops.length > 0) {
+      try {
+        await Inventory.bulkWrite(ops, { ordered: false });
+      } catch (e) {
+        console.warn('Error updating inventory statuses:', e && e.message);
+      }
+      // reload inventory after updates
+      const refreshed = await Inventory.find();
+      return res.json(refreshed);
+    }
+
     res.json(inventory);
   } catch (err) {
     console.error('Error fetching inventory:', err);
