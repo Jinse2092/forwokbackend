@@ -641,6 +641,85 @@ app.post('/api/orders', async (req, res) => {
     
     console.log('POST /api/orders - Complete order data to save:', JSON.stringify(completeOrderData, null, 2));
     
+    // Only attempt server-side allocation at order creation time if the order is already
+    // in 'packed' status. Otherwise, defer allocation to the pack-time flow (PUT /api/orders/:id)
+    const shouldAllocateNow = String(completeOrderData.status || '').toLowerCase() === 'packed';
+    if (shouldAllocateNow) {
+      // Attempt server-side allocation: build packingDetails by consuming inventory
+      // for each item, prefer batches that match expiryDate and sort by oldest sourceInboundDate/createdAt.
+      const merchantId = completeOrderData.merchantId;
+      const packingDetails = [];
+
+      for (const it of (completeOrderData.items || [])) {
+        let qtyToAllocate = Number(it.quantity || 0);
+        const allocations = [];
+
+        // Find batches that match product + merchant and expiry
+        let candidateBatches = await Inventory.find({ productId: it.productId, merchantId }).lean();
+
+        // First filter to exact expiry match (null/undefined handled)
+        const itemExpiry = it.expiryDate || null;
+        let matched = candidateBatches.filter(b => (b.expiryDate || null) == itemExpiry);
+
+        if (!matched.length) {
+          // fallback to any batches
+          matched = candidateBatches;
+        }
+
+        // Sort by sourceInboundDate then createdAt (oldest first)
+        matched.sort((a, b) => {
+          const da = new Date(a.sourceInboundDate || a.createdAt || 0).getTime() || 0;
+          const db = new Date(b.sourceInboundDate || b.createdAt || 0).getTime() || 0;
+          return da - db;
+        });
+
+        for (const batch of matched) {
+          if (qtyToAllocate <= 0) break;
+          const available = Number(batch.quantity || 0);
+          if (available <= 0) continue;
+          const used = Math.min(available, qtyToAllocate);
+
+          // Try to decrement atomically to avoid races
+          const updated = await Inventory.findOneAndUpdate(
+            { id: batch.id, quantity: { $gte: used } },
+            { $inc: { quantity: -used } },
+            { new: true }
+          );
+
+          if (!updated) {
+            // Could not reserve this batch (concurrent change) — fail allocation
+            return res.status(409).json({ error: 'Allocation failed due to concurrent inventory change' });
+          }
+
+          allocations.push({ inventoryId: batch.id, expiryDate: batch.expiryDate || null, sourceInboundDate: batch.sourceInboundDate || batch.createdAt || null, used });
+          qtyToAllocate -= used;
+        }
+
+        if (qtyToAllocate > 0) {
+          // Insufficient stock — rollback previous decrements for this order
+          // Simple rollback: increment back allocations already made for this item's allocations
+          for (const pd of packingDetails) {
+            for (const a of pd.allocations) {
+              await Inventory.findOneAndUpdate({ id: a.inventoryId }, { $inc: { quantity: a.used } });
+            }
+          }
+          // rollback allocations made for current item as well
+          for (const a of allocations) {
+            await Inventory.findOneAndUpdate({ id: a.inventoryId }, { $inc: { quantity: a.used } });
+          }
+          return res.status(400).json({ error: `Insufficient stock for product ${it.productId}` });
+        }
+
+        if (allocations.length) packingDetails.push({ productId: it.productId, allocations });
+      }
+
+      // Attach packingDetails to order before saving
+      completeOrderData.packingDetails = packingDetails;
+    } else {
+      // Defer allocation: ensure no packingDetails are set on create for non-packed orders
+      delete completeOrderData.packingDetails;
+    }
+
     const newOrder = new Order(completeOrderData);
     const savedOrder = await newOrder.save();
     console.log('POST /api/orders - Saved order to DB:', JSON.stringify(savedOrder.toObject(), null, 2));
@@ -668,6 +747,119 @@ app.post('/api/orders', async (req, res) => {
     res.status(500).json({ error: 'Internal Server Error', details: err.message });
   }
 });
+
+    // Force allocation for an existing order (useful when order is already packed but missing packingDetails)
+    app.post('/api/orders/:id/allocate', async (req, res) => {
+      const id = req.params.id;
+      try {
+        const existingOrder = await Order.findOne({ id });
+        if (!existingOrder) return res.status(404).json({ error: 'Order not found' });
+
+        if (existingOrder.packingDetails && Array.isArray(existingOrder.packingDetails) && existingOrder.packingDetails.length > 0) {
+          return res.json(existingOrder.toObject ? existingOrder.toObject() : existingOrder);
+        }
+
+        const orderDate = existingOrder.date ? new Date(existingOrder.date) : new Date();
+        const threshold = new Date(orderDate); threshold.setDate(threshold.getDate() + 3);
+
+        const insufficient = [];
+        const allocationsToApply = [];
+
+        for (const item of existingOrder.items || []) {
+          let remaining = Number(item.quantity || 0);
+          let batches = await Inventory.find({ productId: item.productId, merchantId: existingOrder.merchantId }).lean();
+
+          // filter expired
+          const now = new Date();
+          batches = batches.filter(b => {
+            if (!b) return false;
+            if (b.expiryDate) {
+              const be = new Date(b.expiryDate);
+              if (isNaN(be.getTime())) return true;
+              return be.getTime() >= now.getTime();
+            }
+            return true;
+          });
+
+          // sort by proximity to orderDate, then older inbound
+          const orderMs = orderDate.getTime();
+          const toMs = (v) => { try { const d = new Date(v); return isNaN(d.getTime()) ? 0 : d.getTime(); } catch (e) { return 0; } };
+          batches.sort((a, b) => {
+            const sa = toMs(a.sourceInboundDate || a.createdAt || 0);
+            const sb = toMs(b.sourceInboundDate || b.createdAt || 0);
+            const da = Math.abs(sa - orderMs);
+            const db = Math.abs(sb - orderMs);
+            if (da !== db) return da - db;
+            return sa - sb;
+          });
+
+          const allocations = [];
+          for (const batch of batches) {
+            if (batch.expiryDate) {
+              const be = new Date(batch.expiryDate);
+              if (isNaN(be.getTime()) || be.getTime() < threshold.getTime()) continue;
+            }
+            const avail = Number(batch.quantity || 0);
+            if (avail <= 0) continue;
+            const use = Math.min(avail, remaining);
+            allocations.push({ id: batch.id, use });
+            remaining -= use;
+            if (remaining <= 0) break;
+          }
+
+          if (remaining > 0) insufficient.push({ productId: item.productId, missing: remaining });
+          else allocationsToApply.push({ productId: item.productId, allocations, itemExpiry: item.expiryDate || null });
+        }
+
+        if (insufficient.length > 0) {
+          const details = insufficient.map(s => `${s.productId} (missing ${s.missing})`).join(', ');
+          return res.status(400).json({ error: 'Insufficient expiry-safe stock for packing', details });
+        }
+
+        const packingDetails = [];
+        for (const entry of allocationsToApply) {
+          const pd = { productId: entry.productId, allocations: [] };
+          for (const a of entry.allocations) {
+            const invDoc = await Inventory.findOne({ id: a.id }).lean();
+            let expiryDate = invDoc && invDoc.expiryDate ? String(invDoc.expiryDate) : null;
+            if (!expiryDate && entry.itemExpiry) expiryDate = String(entry.itemExpiry);
+            let sourceInboundDate = invDoc && invDoc.sourceInboundDate ? String(invDoc.sourceInboundDate) : null;
+            if (!sourceInboundDate) {
+              try {
+                const relatedInbound = await Inbound.findOne({ merchantId: existingOrder.merchantId, 'items.productId': entry.productId }).sort({ receivedDate: -1, date: -1 }).lean();
+                if (relatedInbound) {
+                  sourceInboundDate = relatedInbound.receivedDate || relatedInbound.date || null;
+                  if (!expiryDate && Array.isArray(relatedInbound.items)) {
+                    const matchItem = relatedInbound.items.find(it => String(it.productId) === String(entry.productId));
+                    if (matchItem && matchItem.expiryDate) expiryDate = String(matchItem.expiryDate);
+                  }
+                }
+              } catch (e) { console.warn('related inbound lookup failed', e && e.message); }
+            }
+            if (!sourceInboundDate && invDoc && invDoc.createdAt) sourceInboundDate = String(invDoc.createdAt);
+
+            const updatedInv = await Inventory.findOneAndUpdate({ id: a.id, quantity: { $gte: a.use } }, { $inc: { quantity: -a.use } }, { new: true });
+            if (!updatedInv) {
+              // rollback
+              for (const pdx of packingDetails) {
+                for (const ap of pdx.allocations) await Inventory.findOneAndUpdate({ id: ap.inventoryId }, { $inc: { quantity: ap.used } });
+              }
+              return res.status(409).json({ error: 'Allocation failed due to concurrent inventory change' });
+            }
+
+            pd.allocations.push({ inventoryId: a.id, expiryDate, sourceInboundDate, used: a.use });
+          }
+          packingDetails.push(pd);
+        }
+
+        existingOrder.packingDetails = packingDetails;
+        const saved = await existingOrder.save();
+        return res.json(saved.toObject ? saved.toObject() : saved);
+      } catch (err) {
+        console.error('Force allocation error for order', id, err && (err.stack || err.message));
+        return res.status(500).json({ error: 'Allocation failed', details: err && err.message });
+      }
+    });
 
 /**
  * Server-side endpoint to upload a backup JSON to an application-owned Google Drive
@@ -908,6 +1100,7 @@ app.put('/api/orders/:id', async (req, res) => {
     // Persist packedweight if provided
     if (updatedData.packedweight !== undefined) existingOrder.packedweight = updatedData.packedweight;
     if (updatedData.packedAt !== undefined) existingOrder.packedAt = updatedData.packedAt;
+    if (updatedData.packedBy !== undefined) existingOrder.packedBy = updatedData.packedBy;
     // Persist dispatch/delivery timestamps if provided
     if (updatedData.dispatchedAt !== undefined) {
       console.log(`PUT /api/orders/${id} - received dispatchedAt:`, updatedData.dispatchedAt, typeof updatedData.dispatchedAt);
@@ -992,8 +1185,14 @@ app.put('/api/orders/:id', async (req, res) => {
     }, null, 2));
 
     // Save the updated order
-    // If status transitioned to 'packed', attempt to allocate expiry-safe inventory batches
-    if (existingOrder.status === 'packed' && originalStatus !== 'packed') {
+    // If status transitioned to 'packed' (case-insensitive), attempt to allocate expiry-safe inventory batches
+    const prevStatusRaw = (originalStatus !== undefined && originalStatus !== null) ? originalStatus : '';
+    const prevStatusNorm = String(prevStatusRaw).toLowerCase();
+    const newStatusNorm = existingOrder && existingOrder.status ? String(existingOrder.status).toLowerCase() : '';
+    // Run allocation when the status changes to packed, or when the order is already
+    // marked packed but has no `packingDetails` (covers cases where packingDetails
+    // were not created earlier).
+    if (newStatusNorm === 'packed' && (prevStatusNorm !== 'packed' || !existingOrder.packingDetails || existingOrder.packingDetails.length === 0)) {
       try {
         const orderDate = existingOrder.date ? new Date(existingOrder.date) : new Date();
         const threshold = new Date(orderDate);
@@ -1005,21 +1204,34 @@ app.put('/api/orders/:id', async (req, res) => {
         for (const item of existingOrder.items || []) {
           let remaining = Number(item.quantity || 0);
           // fetch all batches for this product+merchant
-          const batches = await Inventory.find({ productId: item.productId, merchantId: existingOrder.merchantId }).lean();
-          // sort by expiry (earliest first). treat missing expiry as far future
+          let batches = await Inventory.find({ productId: item.productId, merchantId: existingOrder.merchantId }).lean();
+
+          // Filter out expired batches (use expiryDate if present)
+          const now = new Date();
+          batches = batches.filter(b => {
+            if (!b) return false;
+            if (b.expiryDate) {
+              const be = new Date(b.expiryDate);
+              if (isNaN(be.getTime())) return true; // treat invalid expiry as non-expired
+              return be.getTime() >= now.getTime();
+            }
+            return true;
+          });
+
+          // Prefer batches nearest to the order date; tie-breaker: older inbound (smaller sourceInboundDate)
+          const orderDate = existingOrder.date ? new Date(existingOrder.date) : new Date();
+          const toMillis = (d) => (d instanceof Date && !isNaN(d.getTime())) ? d.getTime() : 0;
           batches.sort((a, b) => {
-            const da = a.expiryDate ? new Date(a.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
-            const db = b.expiryDate ? new Date(b.expiryDate).getTime() : Number.MAX_SAFE_INTEGER;
-            return da - db;
+            const sa = toMillis(new Date(a.sourceInboundDate || a.createdAt || 0));
+            const sb = toMillis(new Date(b.sourceInboundDate || b.createdAt || 0));
+            const da = Math.abs(toMillis(new Date(sa)) - toMillis(orderDate));
+            const db = Math.abs(toMillis(new Date(sb)) - toMillis(orderDate));
+            if (da !== db) return da - db; // nearest to order date first
+            return sa - sb; // older inbound first
           });
 
           const allocations = [];
           for (const batch of batches) {
-            // skip batches that expire before threshold
-            if (batch.expiryDate) {
-              const be = new Date(batch.expiryDate);
-              if (isNaN(be.getTime()) || be.getTime() < threshold.getTime()) continue;
-            }
             const avail = Number(batch.quantity || 0);
             if (avail <= 0) continue;
             const use = Math.min(avail, remaining);
@@ -1031,7 +1243,7 @@ app.put('/api/orders/:id', async (req, res) => {
           if (remaining > 0) {
             insufficient.push({ productId: item.productId, missing: remaining });
           } else {
-            allocationsToApply.push({ productId: item.productId, allocations });
+            allocationsToApply.push({ productId: item.productId, allocations, itemExpiry: item.expiryDate || null });
           }
         }
 
@@ -1048,8 +1260,30 @@ app.put('/api/orders/:id', async (req, res) => {
           for (const a of entry.allocations) {
             // fetch batch metadata to record expiry/sourceInbound
             const invDoc = await Inventory.findOne({ id: a.id }).lean();
-            const expiryDate = invDoc && invDoc.expiryDate ? String(invDoc.expiryDate) : null;
-            const sourceInboundDate = invDoc && invDoc.sourceInboundDate ? String(invDoc.sourceInboundDate) : null;
+            // Determine expiryDate: prefer inventory, then order item expiry, then any inbound item expiry
+            let expiryDate = invDoc && invDoc.expiryDate ? String(invDoc.expiryDate) : null;
+            if (!expiryDate && entry.itemExpiry) expiryDate = String(entry.itemExpiry);
+            // Determine sourceInboundDate: prefer inventory, then inbound receivedDate, then createdAt
+            let sourceInboundDate = invDoc && invDoc.sourceInboundDate ? String(invDoc.sourceInboundDate) : null;
+            if (!sourceInboundDate) {
+              // try find a related inbound that mentions this product for this merchant
+              try {
+                const relatedInbound = await Inbound.findOne({ merchantId: existingOrder.merchantId, 'items.productId': entry.productId }).sort({ receivedDate: -1, date: -1 }).lean();
+                if (relatedInbound) {
+                  // prefer receivedDate then date
+                  sourceInboundDate = relatedInbound.receivedDate || relatedInbound.date || null;
+                  // if expiry still missing, try to get expiry from matching inbound item
+                  if (!expiryDate && Array.isArray(relatedInbound.items)) {
+                    const matchItem = relatedInbound.items.find(it => String(it.productId) === String(entry.productId));
+                    if (matchItem && matchItem.expiryDate) expiryDate = String(matchItem.expiryDate);
+                  }
+                }
+              } catch (e) {
+                console.warn('Failed to lookup related inbound for allocation metadata', e && e.message);
+              }
+            }
+            // fallback to inventory createdAt if still missing
+            if (!sourceInboundDate && invDoc && invDoc.createdAt) sourceInboundDate = String(invDoc.createdAt);
             // atomic decrement
             await Inventory.findOneAndUpdate({ id: a.id }, { $inc: { quantity: -a.use } });
             pd.allocations.push({ inventoryId: a.id, expiryDate, sourceInboundDate, used: a.use });
@@ -1444,6 +1678,10 @@ const inventorySchema = new mongoose.Schema({
   location: String,
   minStockLevel: Number,
   maxStockLevel: Number,
+  // Track the inbound date for the batch so allocations can prefer oldest batches
+  sourceInboundDate: { type: String, default: null },
+  // Track when inventory batch record was created
+  createdAt: { type: String, default: () => new Date().toISOString() }
 });
 const Inventory = mongoose.model('Inventory', inventorySchema);
 
@@ -1858,6 +2096,63 @@ app.put('/api/inbounds/:id', async (req, res) => {
     if (!updatedInbound) {
       return res.status(404).json({ error: 'Inbound not found' });
     }
+    // If inbound was completed and it's an 'inbound' type, ensure server-side
+    // consolidation of inventory batches for stronger guarantees. This will
+    // merge any existing inventory docs that share productId, merchantId,
+    // expiryDate and sourceInboundDate into a single record, or create one
+    // if none exist for the inbound items.
+    if (String(updatedInbound.status).toLowerCase() === 'completed' && String(updatedInbound.type).toLowerCase() === 'inbound') {
+      try {
+        const sourceDate = updatedInbound.receivedDate || updatedInbound.date || new Date().toISOString().slice(0,10);
+        const merchantId = updatedInbound.merchantId;
+        for (const item of (updatedInbound.items || [])) {
+          const expiryKey = item.expiryDate || null;
+          // Find inventory docs matching this exact batch key
+          const matches = await Inventory.find({
+            merchantId: merchantId,
+            productId: item.productId,
+            expiryDate: expiryKey,
+            sourceInboundDate: sourceDate
+          }).exec();
+
+          if (!matches || matches.length === 0) {
+            // No existing batch record for this inbound; create one
+            const inv = new Inventory({
+              id: `inv-${Date.now()}-${Math.floor(Math.random()*10000)}`,
+              productId: item.productId,
+              merchantId: merchantId,
+              quantity: Number(item.quantity || 0),
+              expiryDate: expiryKey,
+              location: item.location || 'Default Warehouse',
+              minStockLevel: 0,
+              maxStockLevel: 0,
+              sourceInboundDate: sourceDate,
+              createdAt: new Date().toISOString()
+            });
+            await inv.save();
+          } else {
+            // Consolidate duplicates into a single master record
+            const totalQty = matches.reduce((s, m) => s + Number(m.quantity || 0), 0);
+            const master = matches[0];
+            // Update master quantity if needed
+            if (Number(master.quantity || 0) !== totalQty) {
+              await Inventory.findOneAndUpdate({ id: master.id }, { $set: { quantity: totalQty } }, { new: true }).exec();
+            }
+            // Remove duplicate docs (preserve master)
+            for (const dup of matches.slice(1)) {
+              try {
+                await Inventory.deleteOne({ id: dup.id }).exec();
+              } catch (e) {
+                console.warn('Failed to delete duplicate inventory doc', dup.id, e && e.message);
+              }
+            }
+          }
+        }
+      } catch (mergeErr) {
+        console.error('Error consolidating inventory for inbound', id, mergeErr && (mergeErr.stack || mergeErr));
+      }
+    }
+
     res.json(updatedInbound);
   } catch (err) {
     console.error('Error updating inbound:', err);
@@ -2556,8 +2851,41 @@ async function createShopifyOrder(payload, merchantId, webhookId) {
     date: new Date().toISOString().slice(0, 10),
     time: new Date().toLocaleTimeString()
   });
-
-  await order.save();
+  // Server-side allocation: build packingDetails and decrement inventory batches by oldest inbound date
+  try {
+    const packingDetails = [];
+    for (const it of order.items || []) {
+      let qtyToAllocate = Number(it.quantity || 0);
+      const allocations = [];
+      const candidateBatches = await Inventory.find({ productId: it.productId, merchantId }).lean();
+      const itemExpiry = it.expiryDate || null;
+      let matched = candidateBatches.filter(b => (b.expiryDate || null) == itemExpiry);
+      if (!matched.length) matched = candidateBatches;
+      matched.sort((a,b) => (new Date(a.sourceInboundDate || a.createdAt || 0).getTime()||0) - (new Date(b.sourceInboundDate || b.createdAt || 0).getTime()||0));
+      for (const batch of matched) {
+        if (qtyToAllocate <= 0) break;
+        const available = Number(batch.quantity || 0);
+        if (available <= 0) continue;
+        const used = Math.min(available, qtyToAllocate);
+        const updated = await Inventory.findOneAndUpdate({ id: batch.id, quantity: { $gte: used } }, { $inc: { quantity: -used } }, { new: true });
+        if (!updated) return; // skip saving if allocation fails
+        allocations.push({ inventoryId: batch.id, expiryDate: batch.expiryDate || null, sourceInboundDate: batch.sourceInboundDate || batch.createdAt || null, used });
+        qtyToAllocate -= used;
+      }
+      if (qtyToAllocate > 0) {
+        // rollback previous allocations
+        for (const pd of packingDetails) for (const a of pd.allocations) await Inventory.findOneAndUpdate({ id: a.inventoryId }, { $inc: { quantity: a.used } });
+        for (const a of allocations) await Inventory.findOneAndUpdate({ id: a.inventoryId }, { $inc: { quantity: a.used } });
+        return; // insufficient stock; abort creating this shopify order
+      }
+      if (allocations.length) packingDetails.push({ productId: it.productId, allocations });
+    }
+    if (packingDetails.length) order.packingDetails = packingDetails;
+    await order.save();
+  } catch (e) {
+    console.error('createShopifyOrder allocation error', e);
+    return;
+  }
 }
 
 // Start server (PUBLIC)

@@ -192,7 +192,7 @@ app.post(
 
       /* ---------- Send to Orders API ---------- */
       await axios.post(
-        "https://api.forvoq.com/api/orders",
+        "http://localhost:4000/api/orders",
         orderPayload,
         {
           timeout: 8000,
@@ -231,7 +231,7 @@ app.post('/fulfill', async (req, res) => {
     // Fetch backend order to check shopifyFulfilled lock and get internal id
     let orderResp;
     try {
-      orderResp = await axios.get(`https://api.forvoq.com/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
+      orderResp = await axios.get(`http://localhost:4000/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
     } catch (e) {
       console.error('Fulfill: failed to fetch order from backend', e && (e.response ? (e.response.status + ' ' + JSON.stringify(e.response.data)) : e.message));
       return res.status(500).json({ error: 'Failed to fetch order from backend' });
@@ -322,7 +322,7 @@ app.post('/fulfill', async (req, res) => {
             try {
               const internalId = order && (order.id || order._id);
               if (internalId) {
-                const markUrl = `https://api.forvoq.com/api/orders/${internalId}/shopify-fulfilled`;
+                const markUrl = `http://localhost:4000/api/orders/${internalId}/shopify-fulfilled`;
                 const markResp = await axios.post(markUrl, {}, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
                 console.log('Fulfill: backend mark-shopify-fulfilled response (legacy)', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
               }
@@ -382,7 +382,7 @@ app.post('/fulfill', async (req, res) => {
         // Use internal order id to mark
         const internalId = order.id || order._id;
         if (internalId) {
-          const markUrl = `https://api.forvoq.com/api/orders/${internalId}/shopify-fulfilled`;
+          const markUrl = `http://localhost:4000/api/orders/${internalId}/shopify-fulfilled`;
           const markResp = await axios.post(markUrl, {}, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
           console.log('Fulfill: backend mark-shopify-fulfilled response', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
         }
@@ -433,7 +433,7 @@ async function fetchOrdersForMerchant(webhook) {
       try {
         // Check for duplicate in backend
         try {
-          const existsResp = await axios.get(`https://api.forvoq.com/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
+          const existsResp = await axios.get(`http://localhost:4000/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
           console.log(`Exists check for ${shopifyOrderId}: status=${existsResp.status}`, existsResp && existsResp.data ? existsResp.data : 'no-body');
           if (existsResp && existsResp.status === 200) {
             console.log(`Order ${shopifyOrderId} already exists in backend; skipping`);
@@ -489,7 +489,7 @@ async function fetchOrdersForMerchant(webhook) {
         };
 
         try {
-          const postResp = await axios.post('https://api.forvoq.com/api/orders', payload, { timeout: 10000, headers: { 'x-service-api-token': 'listener@2025' } });
+          const postResp = await axios.post('http://localhost:4000/api/orders', payload, { timeout: 10000, headers: { 'x-service-api-token': 'listener@2025' } });
           console.log(`Created order in backend for shopifyOrderId=${shopifyOrderId}: status=${postResp.status}`, postResp && postResp.data ? postResp.data : 'no-body');
         } catch (postErr) {
           console.error('Failed to create order in backend for', shopifyOrderId, postErr && (postErr.response ? (postErr.response.status + ' ' + JSON.stringify(postErr.response.data)) : postErr.message));
