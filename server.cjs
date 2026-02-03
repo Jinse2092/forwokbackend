@@ -96,6 +96,9 @@ const Webhook = mongoose.model('Webhook', webhookSchema);
 
 const axios = require('axios');
 
+// Helper to escape regex special chars for exact-match regex building
+const escapeRegex = (s) => String(s || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 // Order schema and model
 const orderSchema = new mongoose.Schema({
   id: { type: String, required: true, unique: true },
@@ -654,8 +657,31 @@ app.post('/api/orders', async (req, res) => {
         let qtyToAllocate = Number(it.quantity || 0);
         const allocations = [];
 
+        // Resolve productId if missing (Shopify items may lack productId) then find batches
+        let pid = it.productId;
+        if (!pid) {
+          try {
+            const skuVal = it.sku || it.skuId || (it.properties && it.properties.sku) || null;
+            const searchOr = [];
+            if (skuVal) {
+              const skuRegex = new RegExp('^' + escapeRegex(String(skuVal).trim()) + '$', 'i');
+              searchOr.push({ sku: skuRegex });
+              searchOr.push({ skus: skuRegex });
+            }
+            if (it.name) {
+              const nameRegex = new RegExp('^' + escapeRegex(String(it.name).trim()) + '$', 'i');
+              searchOr.push({ name: nameRegex });
+            }
+            if (searchOr.length > 0) {
+              const found = await Product.findOne({ $or: searchOr, merchantId });
+              if (found) pid = found.id || found._id;
+            }
+          } catch (e) {
+            console.warn('Initial allocation: product lookup fallback failed', e && e.message);
+          }
+        }
         // Find batches that match product + merchant and expiry
-        let candidateBatches = await Inventory.find({ productId: it.productId, merchantId }).lean();
+        let candidateBatches = await Inventory.find({ productId: pid, merchantId }).lean();
 
         // First filter to exact expiry match (null/undefined handled)
         const itemExpiry = it.expiryDate || null;
@@ -1203,8 +1229,33 @@ app.put('/api/orders/:id', async (req, res) => {
 
         for (const item of existingOrder.items || []) {
           let remaining = Number(item.quantity || 0);
+          // Determine productId to allocate against. Some Shopify-created orders
+          // may not have `productId` set (unknown SKU mapping). In that case,
+          // attempt to resolve a product using SKU or name before allocating.
+          let pid = item.productId;
+          if (!pid) {
+            try {
+              const skuVal = item.sku || item.skuId || (item.properties && item.properties.sku) || null;
+              const searchOr = [];
+              if (skuVal) {
+                const skuRegex = new RegExp('^' + escapeRegex(String(skuVal).trim()) + '$', 'i');
+                searchOr.push({ sku: skuRegex });
+                searchOr.push({ skus: skuRegex });
+              }
+              if (item.name) {
+                const nameRegex = new RegExp('^' + escapeRegex(String(item.name).trim()) + '$', 'i');
+                searchOr.push({ name: nameRegex });
+              }
+              if (searchOr.length > 0) {
+                const found = await Product.findOne({ $or: searchOr, merchantId: existingOrder.merchantId });
+                if (found) pid = found.id || found._id;
+              }
+            } catch (e) {
+              console.warn('Allocation: product lookup fallback failed', e && e.message);
+            }
+          }
           // fetch all batches for this product+merchant
-          let batches = await Inventory.find({ productId: item.productId, merchantId: existingOrder.merchantId }).lean();
+          let batches = await Inventory.find({ productId: pid, merchantId: existingOrder.merchantId }).lean();
 
           // Filter out expired batches (use expiryDate if present)
           const now = new Date();
@@ -1368,13 +1419,53 @@ app.put('/api/orders/:id', async (req, res) => {
         const items = savedOrder.items || [];
         let itemsPackingTotal = 0;
         const pfItems = [];
+        // Ensure allocations exist: if packingDetails present but contain no allocations,
+        // attempt a forced allocation run so we can attach inventory metadata (expiry/sourceInboundDate).
+        try {
+          const hasAlloc = Array.isArray(savedOrder.packingDetails) && savedOrder.packingDetails.some(p => Array.isArray(p.allocations) && p.allocations.length > 0);
+          if (!hasAlloc) {
+            try {
+              console.log(`PUT /api/orders/${id} - missing allocations, forcing allocate endpoint`);
+              await axios.post(`http://localhost:${process.env.PORT || 4000}/api/orders/${id}/allocate` , {}, { timeout: 10000 });
+              // reload savedOrder from DB to pick up allocations
+              const refreshed = await Order.findOne({ id });
+              if (refreshed) savedOrder = refreshed;
+            } catch (forceErr) {
+              console.warn(`PUT /api/orders/${id} - force allocation failed:`, forceErr && (forceErr.response ? (forceErr.response.status + ' ' + JSON.stringify(forceErr.response.data)) : forceErr.message || forceErr));
+            }
+          }
+        } catch (chkErr) {
+          console.warn(`PUT /api/orders/${id} - allocation existence check failed:`, chkErr && chkErr.message);
+        }
         for (const it of items) {
           try {
             let prod = null;
             if (it && it.productId) {
-              prod = await Product.findOne({ id: it.productId });
+              prod = await Product.findOne({ id: it.productId, merchantId: savedOrder.merchantId });
               if (!prod) {
                 try { prod = await Product.findById(it.productId); } catch (e) { prod = null; }
+              }
+            }
+            // If product not found by id, attempt lookups by SKU(s) or name (helps match Shopify items)
+            if (!prod) {
+              try {
+                const skuVal = it.sku || it.skuId || (it.properties && it.properties.sku) || null;
+                const searchOr = [];
+                const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                if (skuVal) {
+                  const skuRegex = new RegExp('^' + escapeRegex(String(skuVal).trim()) + '$', 'i');
+                  searchOr.push({ sku: skuRegex });
+                  searchOr.push({ skus: skuRegex });
+                }
+                if (it.name) {
+                  const nameRegex = new RegExp('^' + escapeRegex(String(it.name).trim()) + '$', 'i');
+                  searchOr.push({ name: nameRegex });
+                }
+                if (searchOr.length > 0) {
+                  prod = await Product.findOne({ $or: searchOr, merchantId: savedOrder.merchantId });
+                }
+              } catch (e) {
+                prod = null;
               }
             }
             prod = prod || {};
@@ -1483,10 +1574,25 @@ app.put('/api/orders/:id', async (req, res) => {
         console.log(`PUT /api/orders/${id} - PackingFee document computed & upserted for order ${id}`);
 
         // Also persist server-calculated per-item breakdown onto the order for immediate client consumption
+        // Merge per-item fee info (pfItems) with any allocation metadata (inventory allocations with expiry/sourceInbound)
         try {
-          savedOrder.packingDetails = pfItems;
+          const existingAllocDetails = Array.isArray(savedOrder.packingDetails) ? savedOrder.packingDetails : [];
+          const merged = pfItems.map(pi => {
+            const alloc = existingAllocDetails.find(ed => String(ed.productId) === String(pi.productId));
+            return {
+              productId: pi.productId || '',
+              name: pi.name || '',
+              quantity: pi.quantity || 0,
+              itemPackingPerItem: Number(pi.itemPackingPerItem || 0),
+              transportationPerItem: Number(pi.transportationPerItem || 0),
+              warehousingPerItem: Number(pi.warehousingPerItem || 0),
+              lineTotal: Number(pi.lineTotal || 0),
+              allocations: alloc && Array.isArray(alloc.allocations) ? alloc.allocations : []
+            };
+          });
+          savedOrder.packingDetails = merged;
         } catch (e) {
-          console.warn('Failed to attach packingDetails to savedOrder object', e);
+          console.warn('Failed to attach merged packingDetails to savedOrder object', e);
         }
 
         if (Number(savedOrder.packingFee || 0) !== totalPackingFee) {
@@ -2079,6 +2185,14 @@ app.post('/api/inbounds', async (req, res) => {
     if (typeof inboundData.deliveryLocation === 'string') {
       inboundData.deliveryLocation = null;
     }
+    // Normalize item expiryDate fields to string or null to avoid Date objects
+    if (Array.isArray(inboundData.items)) {
+      inboundData.items = inboundData.items.map(it => ({
+        ...it,
+        expiryDate: it && it.expiryDate ? String(it.expiryDate) : null,
+        quantity: it && it.quantity ? Number(it.quantity) : 0
+      }));
+    }
     const newInbound = new Inbound(inboundData);
     await newInbound.save();
     res.status(201).json(newInbound);
@@ -2122,11 +2236,11 @@ app.put('/api/inbounds/:id', async (req, res) => {
               productId: item.productId,
               merchantId: merchantId,
               quantity: Number(item.quantity || 0),
-              expiryDate: expiryKey,
+              expiryDate: expiryKey ? String(expiryKey) : null,
               location: item.location || 'Default Warehouse',
               minStockLevel: 0,
               maxStockLevel: 0,
-              sourceInboundDate: sourceDate,
+              sourceInboundDate: sourceDate ? String(sourceDate) : String(new Date().toISOString().split('T')[0]),
               createdAt: new Date().toISOString()
             });
             await inv.save();
