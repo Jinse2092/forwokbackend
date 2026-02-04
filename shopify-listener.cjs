@@ -2,16 +2,31 @@ const express = require("express");
 const mongoose = require("mongoose");
 const axios = require("axios");
 
+// ===== IST TIMESTAMP LOGGER =====
+const getISTTimestamp = () => {
+  const now = new Date();
+  const istTime = new Date(now.getTime() + (5.5 * 60 * 60 * 1000)); // IST is UTC+5:30
+  return istTime.toISOString().replace('T', ' ').slice(0, 23); // Format: YYYY-MM-DD HH:mm:ss
+};
+
+const log = {
+  info: (...args) => console.log(`[${getISTTimestamp()}] [INFO]`, ...args),
+  error: (...args) => console.error(`[${getISTTimestamp()}] [ERROR]`, ...args),
+  warn: (...args) => console.warn(`[${getISTTimestamp()}] [WARN]`, ...args),
+  debug: (...args) => console.log(`[${getISTTimestamp()}] [DEBUG]`, ...args)
+};
+// ================================
+
 // Helper: fetch and log the access scopes for a Shopify access token (useful for debugging 403s)
 async function checkShopifyTokenScopes(shopDomain, token) {
   try {
     const url = `https://${shopDomain}/admin/oauth/access_scopes.json`;
     const resp = await axios.get(url, { headers: { 'X-Shopify-Access-Token': token }, timeout: 8000 });
     const scopes = resp && resp.data && resp.data.access_scopes ? resp.data.access_scopes : null;
-    console.warn(`Shopify token scopes for ${shopDomain}:`, scopes);
+    log.warn(`Shopify token scopes for ${shopDomain}:`, scopes);
     return scopes;
   } catch (err) {
-    console.error('Failed to fetch Shopify access scopes:', err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
+    log.error('Failed to fetch Shopify access scopes:', err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
     throw err;
   }
 }
@@ -84,7 +99,7 @@ mongoose.connect(
 );
 
 mongoose.connection.once("open", () => {
-  console.log("✅ MongoDB connected (Atlas)");
+  log.info("✅ MongoDB connected (Atlas)");
 });
 
 /* -------------------- Schemas -------------------- */
@@ -121,22 +136,22 @@ app.post(
       const shopDomain = req.headers["x-shopify-shop-domain"];
       const shopifyOrderId = String(payload.id);
 
-      console.log("🏪 Shopify Store:", shopDomain);
-      console.log("🛒 Shopify Order ID:", shopifyOrderId);
+      log.info("🏪 Shopify Store:", shopDomain);
+      log.info("🛒 Shopify Order ID:", shopifyOrderId);
 
       /* ---------- Duplicate protection ---------- */
       const alreadyProcessed = await ProcessedOrder.findOne({
         shopifyOrderId,
       });
       if (alreadyProcessed) {
-        console.log("⚠️ Duplicate order ignored");
+        log.warn("⚠️ Duplicate order ignored");
         return res.status(200).send("Duplicate ignored");
       }
 
       /* ---------- Merchant resolution (respect webhook filters) ---------- */
       const webhooksMatched = await Webhook.find({ shopifyDomain: shopDomain, active: true });
       if (!webhooksMatched || webhooksMatched.length === 0) {
-        console.log("❌ No merchant mapped for shop");
+        log.error("❌ No merchant mapped for shop");
         return res.status(200).send("Unknown merchant");
       }
 
@@ -168,18 +183,18 @@ app.post(
         }
         if (found) {
           webhook = found;
-          console.log('🔎 Selected webhook by filters for shop', shopDomain, 'merchantId', webhook.merchantId);
+          log.info('🔎 Selected webhook by filters for shop', shopDomain, 'merchantId', webhook.merchantId);
         } else {
-          console.warn('⚠️ Multiple webhooks for shop found; none matched filters. Using first registered webhook.');
+          log.warn('⚠️ Multiple webhooks for shop found; none matched filters. Using first registered webhook.');
         }
       }
 
       const merchantId = webhook.merchantId;
-      console.log("🆔 Merchant ID:", merchantId);
+      log.info("🆔 Merchant ID:", merchantId);
 
       /* ---------- Load products ---------- */
       const products = await Product.find({ merchantId });
-      console.log("📦 Products in DB:", products.length);
+      log.info("📦 Products in DB:", products.length);
       if (!products.length) {
         try {
           const sample = await Product.find({}).limit(10).select('id sku skus merchantId name').lean();
@@ -219,7 +234,7 @@ app.post(
         if (!product) {
           // Log attempted lookup keys for easier debugging
           try {
-            console.warn('DEBUG: SKU lookup failed for webhook item', { shopifySku: rawSku, lookupKey, normalizedLookupKey: normalizeSku(rawSku), merchantId });
+            log.warn('DEBUG: SKU lookup failed for webhook item', { shopifySku: rawSku, lookupKey, normalizedLookupKey: normalizeSku(rawSku), merchantId });
           } catch (e) {}
           // No product found in DB for this SKU — still include the item
           const qty = Number(item.quantity) || 1;
@@ -235,7 +250,7 @@ app.post(
             unknown: true,
           });
           try {
-            console.log('SKU not found in DB, creating unknown item in order payload', { shopifySku: item.sku, name: unknownName });
+            log.info('SKU not found in DB, creating unknown item in order payload', { shopifySku: item.sku, name: unknownName });
           } catch (e) {}
           continue;
         }
@@ -255,7 +270,7 @@ app.post(
         });
 
         try {
-          console.log('SKU match:', { shopifySku: item.sku, productId: resolvedProductId, productName: product.name });
+          log.info('SKU match:', { shopifySku: item.sku, productId: resolvedProductId, productName: product.name });
         } catch (e) {}
       }
 
@@ -264,7 +279,7 @@ app.post(
       console.log("❌ Unmatched Items:", unmatchedItems);
       if (unmatchedItems.length) {
         try {
-          console.warn('DEBUG: Unmatched SKUs (webhook)', {
+          log.warn('DEBUG: Unmatched SKUs (webhook)', {
             merchantId,
             shopifyOrderId,
             unmatchedCount: unmatchedItems.length,
@@ -273,7 +288,7 @@ app.post(
             productMapSize: Object.keys(productMap || {}).length,
           });
         } catch (e) {
-          console.warn('DEBUG: failed to stringify unmatchedItems');
+          log.warn('DEBUG: failed to stringify unmatchedItems');
         }
       }
 
@@ -320,10 +335,10 @@ app.post(
       /* ---------- Mark processed ---------- */
       await ProcessedOrder.create({ shopifyOrderId });
 
-      console.log("✅ Order forwarded to Orders API");
+      log.info("✅ Order forwarded to Orders API");
       res.status(200).send("OK");
     } catch (err) {
-      console.error("❌ Shopify webhook error:", err.message);
+      log.error("❌ Shopify webhook error:", err.message);
       res.status(200).send("Webhook error");
     }
   }
@@ -334,7 +349,7 @@ app.post(
 app.post('/fulfill', async (req, res) => {
   try {
     const { merchantId, shopifyOrderId, trackingCode, courier } = req.body || {};
-    console.log('/fulfill received:', { merchantId, shopifyOrderId, trackingCode, courier });
+    log.info('/fulfill received:', { merchantId, shopifyOrderId, trackingCode, courier });
     if (!merchantId || !shopifyOrderId || !trackingCode) return res.status(400).json({ error: 'merchantId, shopifyOrderId and trackingCode required' });
 
     // Resolve merchant webhook/token
@@ -348,14 +363,14 @@ app.post('/fulfill', async (req, res) => {
     try {
       orderResp = await axios.get(`http://localhost:4000/api/orders/shopify/${merchantId}/${shopifyOrderId}`, { timeout: 5000 });
     } catch (e) {
-      console.error('Fulfill: failed to fetch order from backend', e && (e.response ? (e.response.status + ' ' + JSON.stringify(e.response.data)) : e.message));
+      log.error('Fulfill: failed to fetch order from backend', e && (e.response ? (e.response.status + ' ' + JSON.stringify(e.response.data)) : e.message));
       return res.status(500).json({ error: 'Failed to fetch order from backend' });
     }
 
     const order = orderResp.data;
     // If backend already marked fulfilled, exit immediately
     if (order && order.shopifyFulfilled) {
-      console.log('Fulfill: order already marked shopifyFulfilled; skipping', shopifyOrderId);
+      log.info('Fulfill: order already marked shopifyFulfilled; skipping', shopifyOrderId);
       return res.json({ message: 'already_fulfilled' });
     }
 
@@ -374,25 +389,25 @@ app.post('/fulfill', async (req, res) => {
             // If 403, attempt to fetch token scopes to help debug missing permissions
             try {
               if (err && err.response && err.response.status === 403) {
-                console.error('Fulfill: Shopify returned 403 when fetching fulfillment_orders - checking token scopes');
+                log.error('Fulfill: Shopify returned 403 when fetching fulfillment_orders - checking token scopes');
                 await checkShopifyTokenScopes(shopDomain, token);
                 return res.status(403).json({ error: 'Shopify token missing required scopes for Fulfillment Orders API. Check app scopes and reinstall/regenerate token.' });
               }
             } catch (scopeErr) {
-              console.warn('Fulfill: failed while checking token scopes', scopeErr && scopeErr.message);
+              log.warn('Fulfill: failed while checking token scopes', scopeErr && scopeErr.message);
             }
             throw err;
           }
       const fulfillmentOrders = foResp && foResp.data && foResp.data.fulfillment_orders ? foResp.data.fulfillment_orders : [];
       if (!fulfillmentOrders.length) {
-        console.warn('Fulfill: no fulfillment_orders found for order', shopifyOrderId);
+        log.warn('Fulfill: no fulfillment_orders found for order', shopifyOrderId);
         // Fetch the full order for diagnostics (no legacy fulfillment fallback)
         try {
           const orderDetailUrl = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/orders/${shopifyOrderId}.json`;
           const orderDetailResp = await safeAxiosRequest(() => axios.get(orderDetailUrl, { headers: { 'X-Shopify-Access-Token': token }, timeout: 10000 }));
-          try { console.log('Fulfill: order details (diagnostics):', JSON.stringify(orderDetailResp.data)); } catch (e) { console.log('Fulfill: could not stringify order details'); }
+          try { log.info('Fulfill: order details (diagnostics):', JSON.stringify(orderDetailResp.data)); } catch (e) { log.info('Fulfill: could not stringify order details'); }
         } catch (orderErr) {
-          console.error('Fulfill: failed to fetch order details for diagnostics', orderErr && (orderErr.response ? (orderErr.response.status + ' ' + JSON.stringify(orderErr.response.data)) : orderErr.message));
+          log.error('Fulfill: failed to fetch order details for diagnostics', orderErr && (orderErr.response ? (orderErr.response.status + ' ' + JSON.stringify(orderErr.response.data)) : orderErr.message));
         }
         return res.status(400).json({ error: 'No fulfillment_orders for order' });
       }
@@ -403,7 +418,7 @@ app.post('/fulfill', async (req, res) => {
       const fulfillUrl = `https://${shopDomain}/admin/api/${SHOPIFY_API_VERSION}/fulfillments.json`;
 
       // Log the fulfillment order for diagnostics
-      try { console.log('Fulfill: fulfillment_order (fo):', JSON.stringify(fo)); } catch (e) { console.log('Fulfill: could not stringify fo'); }
+      try { log.info('Fulfill: fulfillment_order (fo):', JSON.stringify(fo)); } catch (e) { log.info('Fulfill: could not stringify fo'); }
 
       // Build payload exactly as requested: only include fulfillment_order_id in the array
       const payload = {
@@ -422,36 +437,36 @@ app.post('/fulfill', async (req, res) => {
       };
 
       // Log the full JSON payload and curl for reproduction
-      try { console.log('Fulfill: POSTing fulfillment (create)'); } catch (e) { /* noop */ }
-      try { console.log('Fulfill: payload JSON length', String(JSON.stringify(payload)).length); } catch (e) { /* noop */ }
+      try { log.info('Fulfill: POSTing fulfillment (create)'); } catch (e) { /* noop */ }
+      try { log.info('Fulfill: payload JSON length', String(JSON.stringify(payload)).length); } catch (e) { /* noop */ }
       const requestHeaders = { 'X-Shopify-Access-Token': token, 'Content-Type': 'application/json', Accept: 'application/json' };
-      try { console.log('Fulfill: curl:', makeCurl('post', fulfillUrl, requestHeaders, payload)); } catch (e) { /* noop */ }
+      try { log.info('Fulfill: curl:', makeCurl('post', fulfillUrl, requestHeaders, payload)); } catch (e) { /* noop */ }
 
       let postResp;
       try {
         const reqConfig = { headers: requestHeaders, timeout: 15000 };
-        console.log('Fulfill: request config', { url: fulfillUrl, method: 'POST', headers: requestHeaders, timeout: reqConfig.timeout });
+        log.info('Fulfill: request config', { url: fulfillUrl, method: 'POST', headers: requestHeaders, timeout: reqConfig.timeout });
         postResp = await safeAxiosRequest(() => axios.post(fulfillUrl, payload, reqConfig));
-        console.log('Fulfill: Shopify fulfillment create response', { status: postResp.status, data: postResp && postResp.data ? postResp.data : 'no-body' });
+        log.info('Fulfill: Shopify fulfillment create response', { status: postResp.status, data: postResp && postResp.data ? postResp.data : 'no-body' });
       } catch (err) {
         // Detailed diagnostic logging and surface error (no alternative payloads)
         try {
           if (err && err.response) {
-            console.error('Fulfill: Shopify error status:', err.response.status);
-            try { console.error('Fulfill: Shopify error headers:', JSON.stringify(err.response.headers)); } catch (e) { console.error('Could not stringify headers'); }
-            try { console.error('Fulfill: Shopify error data:', JSON.stringify(err.response.data)); } catch (e) { console.error('Could not stringify data'); }
+            log.error('Fulfill: Shopify error status:', err.response.status);
+            try { log.error('Fulfill: Shopify error headers:', JSON.stringify(err.response.headers)); } catch (e) { log.error('Could not stringify headers'); }
+            try { log.error('Fulfill: Shopify error data:', JSON.stringify(err.response.data)); } catch (e) { log.error('Could not stringify data'); }
           } else {
-            console.error('Fulfill: Shopify request error (no response):', err && err.message);
+            log.error('Fulfill: Shopify request error (no response):', err && err.message);
           }
         } catch (logErr) {
-          console.error('Fulfill: error while logging Shopify error', logErr && logErr.message);
+          log.error('Fulfill: error while logging Shopify error', logErr && logErr.message);
         }
 
         try {
           if (err && err.config) {
-            try { console.log('Fulfill: axios config.headers:', JSON.stringify(err.config.headers)); } catch (e) { console.log('Fulfill: axios config.headers (could not stringify)'); }
-            try { console.log('Fulfill: axios config.data:', err.config.data ? err.config.data : 'no-data'); } catch (e) { console.log('Fulfill: axios config.data (could not stringify)'); }
-            try { console.log('Fulfill: reproduce with curl:', makeCurl(err.config.method || 'post', err.config.url || fulfillUrl, err.config.headers || requestHeaders, err.config.data || payload)); } catch (e) { console.log('Fulfill: could not create curl'); }
+            try { log.debug('Fulfill: axios config.headers:', JSON.stringify(err.config.headers)); } catch (e) { log.debug('Fulfill: axios config.headers (could not stringify)'); }
+            try { log.debug('Fulfill: axios config.data:', err.config.data ? err.config.data : 'no-data'); } catch (e) { log.debug('Fulfill: axios config.data (could not stringify)'); }
+            try { log.debug('Fulfill: reproduce with curl:', makeCurl(err.config.method || 'post', err.config.url || fulfillUrl, err.config.headers || requestHeaders, err.config.data || payload)); } catch (e) { log.debug('Fulfill: could not create curl'); }
           }
         } catch (logErr) {
           console.error('Fulfill: error while logging axios config', logErr && logErr.message);
@@ -468,10 +483,10 @@ app.post('/fulfill', async (req, res) => {
         if (internalId) {
           const markUrl = `http://localhost:4000/api/orders/${internalId}/shopify-fulfilled`;
           const markResp = await axios.post(markUrl, {}, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
-          console.log('Fulfill: backend mark-shopify-fulfilled response', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
+          log.info('Fulfill: backend mark-shopify-fulfilled response', { status: markResp.status, data: markResp && markResp.data ? markResp.data : 'no-body' });
         }
       } catch (markErr) {
-        console.warn('Fulfill: failed to mark order fulfilled on backend', markErr && (markErr.response ? (markErr.response.status + ' ' + JSON.stringify(markErr.response.data)) : markErr.message));
+        log.warn('Fulfill: failed to mark order fulfilled on backend', markErr && (markErr.response ? (markErr.response.status + ' ' + JSON.stringify(markErr.response.data)) : markErr.message));
       }
 
       // Also update backend with tracking code and mark as packed
@@ -482,19 +497,19 @@ app.post('/fulfill', async (req, res) => {
           await axios.patch(trackUrl, { trackingCode }, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
           const putUrl = `http://localhost:4000/api/orders/${internalId}`;
           await axios.put(putUrl, { status: 'packed', packedAt: new Date().toISOString() }, { headers: { 'x-service-api-token': 'listener@2025' }, timeout: 5000 });
-          console.log('Fulfill: backend updated trackingCode and marked packed', internalId);
+          log.info('Fulfill: backend updated trackingCode and marked packed', internalId);
         }
       } catch (updateErr) {
-        console.warn('Fulfill: failed to update backend with tracking/packed', updateErr && (updateErr.response ? (updateErr.response.status + ' ' + JSON.stringify(updateErr.response.data)) : updateErr.message));
+        log.warn('Fulfill: failed to update backend with tracking/packed', updateErr && (updateErr.response ? (updateErr.response.status + ' ' + JSON.stringify(updateErr.response.data)) : updateErr.message));
       }
 
       return res.json({ message: 'fulfilled', shopifyResponseStatus: postResp.status, shopifyResponse: postResp.data });
     } catch (err) {
-      console.error('Fulfill: failed during fulfillment flow', err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
+      log.error('Fulfill: failed during fulfillment flow', err && (err.response ? (err.response.status + ' ' + JSON.stringify(err.response.data)) : err.message));
       return res.status(500).json({ error: 'Fulfillment failed', details: err && (err.response ? err.response.data : err.message) });
     }
   } catch (err) {
-    console.error('Fulfill endpoint error', err && err.message);
+    log.error('Fulfill endpoint error', err && err.message);
     return res.status(500).json({ error: 'Internal Error' });
   }
 });
@@ -523,7 +538,7 @@ async function fetchOrdersForMerchant(webhook) {
 
     const resp = await safeAxiosRequest(() => axios.get(url, { params: { created_at_min, created_at_max, fulfillment_status: 'unfulfilled' }, headers: { 'X-Shopify-Access-Token': token }, timeout: 15000 }));
     const orders = (resp && resp.data && resp.data.orders) ? resp.data.orders : [];
-    console.log(`Fetched ${orders.length} orders for ${shopDomain}`);
+    log.info(`Fetched ${orders.length} orders for ${shopDomain}`);
 
     for (const o of orders) {
       const shopifyOrderId = String(o.id);
@@ -551,17 +566,17 @@ async function fetchOrdersForMerchant(webhook) {
           if (!province || !states.includes(province)) passes = false;
         }
         if (!passes) {
-          console.log(`Skipping order ${shopifyOrderId} — does not match webhook.filters for merchant ${webhook.merchantId}`);
+          log.info(`Skipping order ${shopifyOrderId} — does not match webhook.filters for merchant ${webhook.merchantId}`);
           continue;
         }
       } catch (filterErr) {
-        console.warn('Error while applying webhook filters, continuing with order', filterErr && filterErr.message);
+        log.warn('Error while applying webhook filters, continuing with order', filterErr && filterErr.message);
       }
-      console.log(`Processing fetched order ${shopifyOrderId} for merchant ${merchantId}`);
+      log.info(`Processing fetched order ${shopifyOrderId} for merchant ${merchantId}`);
       try {
-        console.log('Fetched order summary', { id: shopifyOrderId, line_items_count: (o.line_items || []).length, has_shipping: !!o.shipping_address, fulfillment_status: o.fulfillment_status || null });
+        log.info('Fetched order summary', { id: shopifyOrderId, line_items_count: (o.line_items || []).length, has_shipping: !!o.shipping_address, fulfillment_status: o.fulfillment_status || null });
       } catch (e) {
-        console.log('Could not stringify fetched order summary');
+        log.info('Could not stringify fetched order summary');
       }
       try {
         // Check for duplicate in backend
@@ -620,9 +635,9 @@ async function fetchOrdersForMerchant(webhook) {
             const weightPerItem = Number(prod.weightKg || 0);
             const resolvedProductId = (prod && prod.id) ? String(prod.id) : '';
             matchedItems.push({ productId: resolvedProductId, name: prod.name, quantity: qty, weightPerItemKg: weightPerItem, weightKg: weightPerItem * qty });
-            try { console.log('fetchOrdersForMerchant SKU match', { shopifySku: skuRaw, productId: resolvedProductId, productName: prod.name }); } catch (e) {}
+            try { log.info('fetchOrdersForMerchant SKU match', { shopifySku: skuRaw, productId: resolvedProductId, productName: prod.name }); } catch (e) {}
           } else {
-            try { console.warn('DEBUG: fetchOrdersForMerchant SKU lookup failed', { shopifySku: skuRaw, skuKey, skuNormalized: normalizeSku(skuRaw), merchantId }); } catch (e) {}
+            try { log.warn('DEBUG: fetchOrdersForMerchant SKU lookup failed', { shopifySku: skuRaw, skuKey, skuNormalized: normalizeSku(skuRaw), merchantId }); } catch (e) {}
             unmatchedItems.push({ sku: skuRaw, title: li.title || '' });
             matchedItems.push({ sku: skuRaw, name: 'Unknown', quantity: qty });
           }
@@ -630,7 +645,7 @@ async function fetchOrdersForMerchant(webhook) {
 
         if (unmatchedItems.length) {
           try {
-            console.warn('DEBUG: fetchOrdersForMerchant unmatched SKUs', {
+            log.warn('DEBUG: fetchOrdersForMerchant unmatched SKUs', {
               merchantId,
               shopifyOrderId,
               unmatchedCount: unmatchedItems.length,
@@ -639,7 +654,7 @@ async function fetchOrdersForMerchant(webhook) {
               productKeysSample: Object.keys(productMap || {}).slice(0, 20),
             });
           } catch (e) {
-            console.warn('DEBUG: could not stringify fetchOrdersForMerchant unmatched items');
+            log.warn('DEBUG: could not stringify fetchOrdersForMerchant unmatched items');
           }
         }
 
@@ -659,9 +674,9 @@ async function fetchOrdersForMerchant(webhook) {
 
         try {
           const postResp = await axios.post('http://localhost:4000/api/orders', payload, { timeout: 10000, headers: { 'x-service-api-token': 'listener@2025' } });
-          console.log(`Created order in backend for shopifyOrderId=${shopifyOrderId}: status=${postResp.status}`, postResp && postResp.data ? postResp.data : 'no-body');
+          log.info(`Created order in backend for shopifyOrderId=${shopifyOrderId}: status=${postResp.status}`, postResp && postResp.data ? postResp.data : 'no-body');
         } catch (postErr) {
-          console.error('Failed to create order in backend for', shopifyOrderId, postErr && (postErr.response ? (postErr.response.status + ' ' + JSON.stringify(postErr.response.data)) : postErr.message));
+          log.error('Failed to create order in backend for', shopifyOrderId, postErr && (postErr.response ? (postErr.response.status + ' ' + JSON.stringify(postErr.response.data)) : postErr.message));
         }
       } catch (inner) {
         console.error('Error processing shopify order', o && o.id, inner && inner.message);
@@ -678,18 +693,18 @@ async function fetchOrdersForMerchant(webhook) {
 async function processAllMerchants() {
   try {
     const merchants = await Webhook.find({ active: true });
-    console.log(`Processing ${merchants.length} active merchants sequentially`);
+    log.info(`Processing ${merchants.length} active merchants sequentially`);
     for (const m of merchants) {
       try {
         await fetchOrdersForMerchant(m);
       } catch (e) {
-        console.error('Error processing merchant', m && m.merchantId, e && e.message);
+        log.error('Error processing merchant', m && m.merchantId, e && e.message);
       }
       // Small pause between merchants to reduce rate pressure
       await sleep(500);
     }
   } catch (err) {
-    console.error('processAllMerchants error', err && err.message);
+    log.error('processAllMerchants error', err && err.message);
   }
 }
 
@@ -699,10 +714,10 @@ const POLL_MINUTES = Number(process.env.SHOPIFY_POLL_MINUTES || 15);
   try {
     await processAllMerchants();
     setInterval(() => {
-      processAllMerchants().catch(e => console.error('Periodic fetch error', e));
+      processAllMerchants().catch(e => log.error('Periodic fetch error', e));
     }, POLL_MINUTES * 60 * 1000);
   } catch (e) {
-    console.error('Initial merchant processing failed', e && e.message);
+    log.error('Initial merchant processing failed', e && e.message);
   }
 })();
 
@@ -714,5 +729,5 @@ app.get("/", (req, res) => {
 
 const PORT = 9001;
 app.listen(PORT, () => {
-  console.log(`🚀 Shopify listener listening on port ${PORT}`);
+  log.info(`🚀 Shopify listener listening on port ${PORT}`);
 });

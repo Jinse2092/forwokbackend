@@ -1,5 +1,20 @@
 require('dotenv').config();
 
+// ===== IST TIMESTAMP LOGGER =====
+const getISTTimestamp = () => {
+  const now = new Date();
+  const istTime = new Date(now.getTime() + (5.5 * 60 * 60 * 1000)); // IST is UTC+5:30
+  return istTime.toISOString().replace('T', ' ').slice(0, 23); // Format: YYYY-MM-DD HH:mm:ss
+};
+
+const log = {
+  info: (...args) => console.log(`[${getISTTimestamp()}] [INFO]`, ...args),
+  error: (...args) => console.error(`[${getISTTimestamp()}] [ERROR]`, ...args),
+  warn: (...args) => console.warn(`[${getISTTimestamp()}] [WARN]`, ...args),
+  debug: (...args) => console.log(`[${getISTTimestamp()}] [DEBUG]`, ...args)
+};
+// ================================
+
 // WARNING: Storing credentials in source is insecure. These values are set for local testing only.
 // Recommended: use environment variables or a secrets manager in production.
 process.env.GMAIL_USER = process.env.GMAIL_USER || 'forvoq@gmail.com';
@@ -47,7 +62,7 @@ app.use('/api/admin', (req, res, next) => {
   try {
     const provided = req.get('x-admin-upload-secret') || '';
     const masked = provided ? (provided.length > 2 ? `${provided[0]}***${provided.slice(-1)}` : '***') : '<none>';
-    console.log(`/api/admin request - x-admin-upload-secret: ${masked} - ${req.method} ${req.path}`);
+    log.info(`/api/admin request - x-admin-upload-secret: ${masked} - ${req.method} ${req.path}`);
   } catch (e) {}
   next();
 });
@@ -55,8 +70,8 @@ app.use('/api/admin', (req, res, next) => {
 // MongoDB connection
 const mongoURI = 'mongodb+srv://LEO:leo112944@cluster0.ye9exkm.mongodb.net/forvoqdb?retryWrites=true&w=majority&appName=Cluster0';
 mongoose.connect(mongoURI)
-  .then(() => console.log('MongoDB connected'))
-  .catch(err => console.error('MongoDB connection error:', err));
+  .then(() => log.info('MongoDB connected'))
+  .catch(err => log.error('MongoDB connection error:', err));
 
 // Define Mongoose schemas and models
 
@@ -585,15 +600,15 @@ app.post('/api/orders', async (req, res) => {
   if (providedSvc) {
     const raw = String(req.get('x-service-api-token') || req.query && req.query.serviceApiToken || (req.body && req.body.serviceApiToken) || '');
     const masked = raw ? (raw.length > 4 ? `${raw.slice(0,2)}***${raw.slice(-2)}` : '***') : '<none>';
-    console.log('POST /api/orders - service token provided (masked):', masked);
+    log.info('POST /api/orders - service token provided (masked):', masked);
     if (!isValidServiceToken(req)) {
-      console.log('POST /api/orders - invalid service token');
+      log.warn('POST /api/orders - invalid service token');
       return res.status(403).json({ error: 'Forbidden: invalid service API token' });
     }
     orderData.source = orderData.source || 'service';
     req.isService = true;
   }
-  console.log('POST /api/orders - Received order data:', JSON.stringify(orderData, null, 2));
+  log.info('POST /api/orders - Received order data:', JSON.stringify(orderData, null, 2));
   // Allow callers (e.g. Shopify listener) to omit `id`. Server will generate
   // a canonical internal id when not provided. If callers include
   // `shopifyWebhookId` + `merchantId`, use that to prevent duplicates.
@@ -1092,7 +1107,7 @@ app.get('/api/orders/shopify/:merchantId/:shopifyOrderId', async (req, res) => {
 app.put('/api/orders/:id', async (req, res) => {
   const id = req.params.id;
   const updatedData = req.body;
-  console.log(`PUT /api/orders/${id} called with data:`, JSON.stringify(updatedData, null, 2));
+  log.info(`PUT /api/orders/${id} called with data:`, JSON.stringify(updatedData, null, 2));
 
   if (updatedData.id && updatedData.id !== id) {
     return res.status(400).json({ error: 'ID in URL and body do not match' });
@@ -1650,7 +1665,7 @@ app.post('/api/orders/:id/shopify-fulfilled', async (req, res) => {
 // Add DELETE endpoint to remove an order by id
 app.delete('/api/orders/:id', authenticateToken, async (req, res) => {
   const id = req.params.id;
-  console.log(`DELETE /api/orders/${id} called by user: ${req.user?.id} (${req.user?.role})`);
+  log.info(`DELETE /api/orders/${id} called by user: ${req.user?.id} (${req.user?.role})`);
   try {
     const order = await Order.findOne({ id });
     if (!order) {
@@ -2288,7 +2303,7 @@ app.get('/api/savedPickupLocations', async (req, res) => {
 });
 
 app.post('/api/savedPickupLocations', async (req, res) => {
-  console.log('POST /api/savedPickupLocations body:', req.body);
+  log.info('POST /api/savedPickupLocations body:', req.body);
   const {
     id,
     merchantId,
@@ -2322,7 +2337,7 @@ app.post('/api/savedPickupLocations', async (req, res) => {
 
 app.put('/api/savedPickupLocations/:id', async (req, res) => {
   const id = req.params.id;
-  console.log(`PUT /api/savedPickupLocations/${id} body:`, req.body);
+  log.info(`PUT /api/savedPickupLocations/${id} body:`, req.body);
   const {
     merchantId,
     buildingNumber,
@@ -2570,7 +2585,7 @@ function isValidServiceToken(req) {
 // POST /login endpoint
 app.post('/login', async (req, res) => {
   const { email, password } = req.body || {};
-  console.log('Login attempt for email:', email);
+  log.info('Login attempt for email:', email);
   if (!email || !password) {
     console.log('Missing email or password');
     return res.status(400).json({ error: 'Email and password are required' });
@@ -2727,7 +2742,7 @@ app.post('/api/inventory/dispatched-aggregate', async (req, res) => {
 
 // PATCH endpoint to update tracking code for an order
 app.patch('/api/orders/:id/tracking-code', async (req, res) => {
-  console.log(`PATCH request received for /api/orders/${req.params.id}/tracking-code`);
+  log.info(`PATCH request received for /api/orders/${req.params.id}/tracking-code`);
   const id = req.params.id;
   // Accept trackingCode even if empty string; ensure property exists in body
   const hasTrackingCodeProp = Object.prototype.hasOwnProperty.call(req.body, 'trackingCode');
@@ -3006,6 +3021,6 @@ async function createShopifyOrder(payload, merchantId, webhookId) {
 
 // Start server (PUBLIC)
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`Server running on port ${PORT}`);
+  log.info(`Server running on port ${PORT}`);
 });
 
