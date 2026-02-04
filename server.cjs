@@ -401,6 +401,7 @@ app.post('/api/merchants/:id/webhooks', async (req, res) => {
       shopifyDomain: body.shopifyDomain || '',
       signature: body.signature || '',
       active: body.active !== undefined ? body.active : true,
+      filters: body.filters || {},
       createdAt: new Date().toISOString()
     });
     try {
@@ -431,6 +432,7 @@ app.post('/api/webhooks', async (req, res) => {
       shopifyDomain: body.shopifyDomain || '',
       signature: body.signature || '',
       active: body.active !== undefined ? body.active : true,
+      filters: body.filters || {},
       createdAt: new Date().toISOString()
     });
     try {
