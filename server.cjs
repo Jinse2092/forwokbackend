@@ -57,6 +57,26 @@ app.use(bodyParser.json({
   }
 }));
 
+// Access logging middleware: log all requests with IP, method, path, and user if authenticated
+app.use((req, res, next) => {
+  let userId = 'unauthenticated';
+  const authHeader = req.headers['authorization'];
+  if (authHeader) {
+    const token = authHeader.split(' ')[1];
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET || 'defaultsecret');
+        userId = decoded.id || 'unknown';
+      } catch (err) {
+        // Invalid token, remain unauthenticated
+      }
+    }
+  }
+  const ip = req.ip || req.connection.remoteAddress || 'unknown';
+  log.info(`Access: ${req.method} ${req.path} - IP: ${ip} - User: ${userId}`);
+  next();
+});
+
 // Debug helper: log presence of admin header for admin routes (masked)
 app.use('/api/admin', (req, res, next) => {
   try {
@@ -569,9 +589,33 @@ try {
 
 async function fetchISTDateTime() {
   return new Promise((resolve, reject) => {
-    ntpClient.getNetworkTime("time.google.com", 123, function(err, date) {
-      if(err) {
-        console.error('Error fetching time from NTP server:', err);
+    // Create NTP promise
+    const ntpPromise = new Promise((ntpResolve, ntpReject) => {
+      ntpClient.getNetworkTime("time.google.com", 123, function(err, date) {
+        if (err) {
+          ntpReject(err);
+        } else {
+          // Convert UTC time to IST (UTC+5:30)
+          const utcTime = date.getTime();
+          const istOffsetMs = 5.5 * 60 * 60 * 1000;
+          const istDate = new Date(utcTime + istOffsetMs);
+          const dateStr = istDate.toISOString().substring(0, 10);
+          const timeStr = istDate.toISOString().substring(11, 19);
+          ntpResolve({ date: dateStr, time: timeStr });
+        }
+      });
+    });
+
+    // Timeout promise (5 seconds)
+    const timeoutPromise = new Promise((_, timeoutReject) => {
+      setTimeout(() => timeoutReject(new Error('NTP timeout')), 5000);
+    });
+
+    // Race NTP against timeout
+    Promise.race([ntpPromise, timeoutPromise])
+      .then(resolve)
+      .catch(err => {
+        console.warn('NTP fetch failed or timed out, using local fallback:', err.message);
         // Fallback to local IST calculation
         const now = new Date();
         const istOffset = 5.5 * 60; // IST offset in minutes
@@ -580,16 +624,7 @@ async function fetchISTDateTime() {
         const dateStr = istTime.toISOString().substring(0, 10);
         const timeStr = istTime.toISOString().substring(11, 19);
         resolve({ date: dateStr, time: timeStr });
-        return;
-      }
-      // Convert UTC time to IST (UTC+5:30)
-      const utcTime = date.getTime();
-      const istOffsetMs = 5.5 * 60 * 60 * 1000;
-      const istDate = new Date(utcTime + istOffsetMs);
-      const dateStr = istDate.toISOString().substring(0, 10);
-      const timeStr = istDate.toISOString().substring(11, 19);
-      resolve({ date: dateStr, time: timeStr });
-    });
+      });
   });
 }
 
@@ -1019,10 +1054,16 @@ app.get('/api/admin/export-all', async (req, res) => {
 
 // GET endpoint to retrieve orders
 app.get('/api/orders', async (req, res) => {
+  log.info('GET /api/orders called with query:', req.query);
   try {
+    const limit = parseInt(req.query.limit) || 10000; // Default limit high for admin
+    const offset = parseInt(req.query.offset) || 0; // Default offset 0
+
     // Use aggregation to join packingfees so frontend gets server-authoritative totalPackingFee
     const orders = await Order.aggregate([
       { $sort: { date: -1 } },
+      { $skip: offset },
+      { $limit: limit },
       { $lookup: {
           from: 'packingfees',
           localField: 'id',
@@ -1038,9 +1079,22 @@ app.get('/api/orders', async (req, res) => {
       } },
       { $project: { pf: 0, pf0: 0 } }
     ]).exec();
-    res.json(orders);
+
+    // Get total count for pagination info
+    const totalCount = await Order.countDocuments();
+
+    log.info(`GET /api/orders returning ${orders.length} orders (total: ${totalCount})`);
+    res.json({
+      orders,
+      pagination: {
+        total: totalCount,
+        limit,
+        offset,
+        hasMore: offset + limit < totalCount
+      }
+    });
   } catch (err) {
-    console.error('Error fetching orders:', err);
+    log.error('Error fetching orders:', err);
     res.status(500).json({ error: 'Internal Server Error' });
   }
 });
